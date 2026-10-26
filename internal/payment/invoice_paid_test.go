@@ -242,7 +242,9 @@ func TestInvoicePaidFollowsTheCurrentSubscription(t *testing.T) {
 	}
 
 	resume := func(lic *model.License) {
-		h.onSubscriptionResumed(ctx, []byte(fmt.Sprintf(`{"id":%q}`, lic.StripeSubscriptionID)))
+		if err := h.onSubscriptionResumed(ctx, []byte(fmt.Sprintf(`{"id":%q}`, lic.StripeSubscriptionID))); err != nil {
+			t.Fatal(err)
+		}
 	}
 	resume(adminSuspended)
 	if st, _ := state(adminSuspended); st != model.StatusSuspended {

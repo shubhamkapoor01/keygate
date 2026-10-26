@@ -419,9 +419,9 @@ func (h *StripeHandler) Webhook(c *gin.Context) {
 	case "invoice.payment_action_required":
 		h.onPaymentActionRequired(ctx, event.Data.Raw)
 	case "customer.subscription.paused":
-		h.onSubscriptionPaused(ctx, event.Data.Raw)
+		herr = h.onSubscriptionPaused(ctx, event.Data.Raw)
 	case "customer.subscription.resumed":
-		h.onSubscriptionResumed(ctx, event.Data.Raw)
+		herr = h.onSubscriptionResumed(ctx, event.Data.Raw)
 	case "customer.subscription.trial_will_end":
 		h.onTrialWillEnd(ctx, event.Data.Raw)
 	case "invoice.upcoming":
@@ -1714,10 +1714,14 @@ func (e *subscriptionEvent) PeriodEnd() int64 {
 // cancelled while the row stays active is worse than silence: the
 // downstream system revokes access the database still grants.
 //
+// A write that failed, rather than one refused as unlinked, stale or
+// restricted, also returns its error; a webhook handler returns it, so
+// Stripe retries the event.
+//
 // asOf, when set, is the StripeReadStamp taken before the Stripe read the
 // write comes from: a newer read already applied wins, and this one is
 // dropped (see store.UpdateLicenseFromSubscriptionRead).
-func (h *StripeHandler) applyLicenseFromSubscription(ctx context.Context, lic *model.License, event string, asOf *time.Time, cols ...string) bool {
+func (h *StripeHandler) applyLicenseFromSubscription(ctx context.Context, lic *model.License, event string, asOf *time.Time, cols ...string) (bool, error) {
 	var err error
 	if asOf != nil {
 		err = h.Store.UpdateLicenseFromSubscriptionRead(ctx, lic, *asOf, cols...)
@@ -1730,34 +1734,34 @@ func (h *StripeHandler) applyLicenseFromSubscription(ctx context.Context, lic *m
 // subscriptionWriteLanded reports whether a write from a subscription
 // event landed, logging why when it did not (see
 // applyLicenseFromSubscription).
-func (h *StripeHandler) subscriptionWriteLanded(lic *model.License, event string, err error) bool {
+func (h *StripeHandler) subscriptionWriteLanded(lic *model.License, event string, err error) (bool, error) {
 	if errors.Is(err, store.ErrSubscriptionUnlinked) {
 		slog.Info("stripe webhook: license was unlinked from this subscription, event ignored",
 			"event", event, "license_id", lic.ID, "subscription_id", lic.StripeSubscriptionID)
-		return false
+		return false, nil
 	}
 	if errors.Is(err, store.ErrStaleSubscriptionRead) {
 		slog.Info("stripe webhook: a newer read of this subscription is already applied, event ignored",
 			"event", event, "license_id", lic.ID, "subscription_id", lic.StripeSubscriptionID)
-		return false
+		return false, nil
 	}
 	if errors.Is(err, store.ErrLicenseRestricted) {
 		slog.Info("stripe webhook: license is revoked, suspended by an operator or ended; event not applied",
 			"event", event, "license_id", lic.ID, "subscription_id", lic.StripeSubscriptionID)
-		return false
+		return false, nil
 	}
 	if err != nil {
 		slog.Error("stripe webhook: license write failed",
 			"event", event, "license_id", lic.ID, "error", err)
-		return false
+		return false, err
 	}
-	return true
+	return true, nil
 }
 
 // endLicenseFromSubscription is applyLicenseFromSubscription for a
 // subscription that is over (see store.UpdateLicenseFromSubscriptionEnded).
 // Callers must stop on false, for the same reason.
-func (h *StripeHandler) endLicenseFromSubscription(ctx context.Context, lic *model.License, cols ...string) bool {
+func (h *StripeHandler) endLicenseFromSubscription(ctx context.Context, lic *model.License, cols ...string) (bool, error) {
 	asOf, err := h.Store.StripeReadStamp(ctx)
 	if err == nil {
 		err = h.Store.UpdateLicenseFromSubscriptionEnded(ctx, lic, asOf, cols...)
@@ -1765,14 +1769,14 @@ func (h *StripeHandler) endLicenseFromSubscription(ctx context.Context, lic *mod
 	if errors.Is(err, store.ErrSubscriptionUnlinked) || errors.Is(err, store.ErrLicenseRestricted) {
 		slog.Info("stripe webhook: license unlinked or revoked, deletion not applied",
 			"event", "customer.subscription.deleted", "license_id", lic.ID, "subscription_id", lic.StripeSubscriptionID)
-		return false
+		return false, nil
 	}
 	if err != nil {
 		slog.Error("stripe webhook: license write failed",
 			"event", "customer.subscription.deleted", "license_id", lic.ID, "error", err)
-		return false
+		return false, err
 	}
-	return true
+	return true, nil
 }
 
 func (h *StripeHandler) onInvoicePaid(ctx context.Context, raw json.RawMessage) error {
@@ -1834,8 +1838,8 @@ func (h *StripeHandler) onInvoicePaid(ctx context.Context, raw json.RawMessage) 
 		lic.PastDueAt = nil
 		lic.SuspendedAt, lic.SuspendedBy = nil, ""
 	}
-	if !h.applyLicenseFromSubscription(ctx, lic, "invoice.paid", nil, "valid_until", "status", "past_due_at", "suspended_at", "suspended_by") {
-		return nil
+	if landed, err := h.applyLicenseFromSubscription(ctx, lic, "invoice.paid", nil, "valid_until", "status", "past_due_at", "suspended_at", "suspended_by"); !landed {
+		return err
 	}
 
 	// Recovery notification — shares the dedup path with
@@ -2000,8 +2004,8 @@ func (h *StripeHandler) applySubscriptionState(ctx context.Context, lic *model.L
 		cols = append(cols, termCols...)
 	}
 	if len(termCols) == 0 {
-		if !h.applyLicenseFromSubscription(ctx, lic, event, readAt, cols...) {
-			return nil
+		if landed, err := h.applyLicenseFromSubscription(ctx, lic, event, readAt, cols...); !landed {
+			return err
 		}
 	} else {
 		before, written, err := h.Store.UpdateLicenseFromSubscriptionReadTerms(ctx, lic, *readAt, cols...)
@@ -2010,7 +2014,7 @@ func (h *StripeHandler) applySubscriptionState(ctx context.Context, lic *model.L
 			// rest goes on, and the event is asked for again at the end.
 			termsHeld, err = true, nil
 		}
-		landed := h.subscriptionWriteLanded(lic, event, err)
+		landed, _ := h.subscriptionWriteLanded(lic, event, err)
 		// The plan and seats are announced when they moved, a suspended
 		// licence's included (see the store's write).
 		if written {
@@ -2122,8 +2126,8 @@ func (h *StripeHandler) onSubscriptionDeleted(ctx context.Context, raw json.RawM
 	// read started before it (and may still have seen "active") cannot
 	// bring the licence back afterwards.
 	lic.StripePendingUpdateExpiresAt = nil
-	if !h.endLicenseFromSubscription(ctx, lic, "status", "canceled_at", "past_due_at", "stripe_pending_update_expires_at") {
-		return nil
+	if landed, err := h.endLicenseFromSubscription(ctx, lic, "status", "canceled_at", "past_due_at", "stripe_pending_update_expires_at"); !landed {
+		return err
 	}
 
 	h.Store.Audit(ctx, &model.AuditLog{
@@ -2173,8 +2177,8 @@ func (h *StripeHandler) onPaymentFailed(ctx context.Context, raw json.RawMessage
 		now := time.Now()
 		lic.Status = model.StatusPastDue
 		lic.PastDueAt = &now
-		if !h.applyLicenseFromSubscription(ctx, lic, "invoice.payment_failed", nil, "status", "past_due_at") {
-			return nil
+		if landed, err := h.applyLicenseFromSubscription(ctx, lic, "invoice.payment_failed", nil, "status", "past_due_at"); !landed {
+			return err
 		}
 	case model.StatusPastDue:
 		// Already moved by a customer.subscription.updated that arrived
@@ -3126,23 +3130,23 @@ func (h *StripeHandler) onPaymentActionRequired(ctx context.Context, raw json.Ra
 	})
 }
 
-func (h *StripeHandler) onSubscriptionPaused(ctx context.Context, raw json.RawMessage) {
+func (h *StripeHandler) onSubscriptionPaused(ctx context.Context, raw json.RawMessage) error {
 	var data struct {
 		ID string `json:"id"`
 	}
 	if json.Unmarshal(raw, &data) != nil {
-		return
+		return nil
 	}
 	lic, err := h.Store.FindLicenseByStripeSubscription(ctx, data.ID)
 	if err != nil {
-		return
+		return nil
 	}
 	lic.Status = model.StatusSuspended
 	now := time.Now()
 	lic.SuspendedAt = &now
 	lic.SuspendedBy = model.SuspendedByStripe // a resume lifts it; an operator's suspension it never replaces
-	if !h.applyLicenseFromSubscription(ctx, lic, "customer.subscription.paused", nil, "status", "suspended_at", "suspended_by") {
-		return
+	if landed, err := h.applyLicenseFromSubscription(ctx, lic, "customer.subscription.paused", nil, "status", "suspended_at", "suspended_by"); !landed {
+		return err
 	}
 
 	h.Store.Audit(ctx, &model.AuditLog{
@@ -3154,25 +3158,26 @@ func (h *StripeHandler) onSubscriptionPaused(ctx context.Context, raw json.RawMe
 			"license_id": lic.ID, "email": lic.Email, "reason": "subscription_paused",
 		})
 	}
+	return nil
 }
 
-func (h *StripeHandler) onSubscriptionResumed(ctx context.Context, raw json.RawMessage) {
+func (h *StripeHandler) onSubscriptionResumed(ctx context.Context, raw json.RawMessage) error {
 	var data struct {
 		ID string `json:"id"`
 	}
 	if json.Unmarshal(raw, &data) != nil {
-		return
+		return nil
 	}
 	lic, err := h.Store.FindLicenseByStripeSubscription(ctx, data.ID)
 	if err != nil {
-		return
+		return nil
 	}
 	lic.Status = model.StatusActive
 	lic.SuspendedAt, lic.SuspendedBy = nil, ""
 	// Lifts a Stripe pause only: the write refuses an operator's
 	// suspension and an ended subscription (store.ErrLicenseRestricted).
-	if !h.applyLicenseFromSubscription(ctx, lic, "customer.subscription.resumed", nil, "status", "suspended_at", "suspended_by") {
-		return
+	if landed, err := h.applyLicenseFromSubscription(ctx, lic, "customer.subscription.resumed", nil, "status", "suspended_at", "suspended_by"); !landed {
+		return err
 	}
 
 	h.Store.Audit(ctx, &model.AuditLog{
@@ -3184,6 +3189,7 @@ func (h *StripeHandler) onSubscriptionResumed(ctx context.Context, raw json.RawM
 			"license_id": lic.ID, "email": lic.Email,
 		})
 	}
+	return nil
 }
 
 func (h *StripeHandler) onTrialWillEnd(ctx context.Context, raw json.RawMessage) {
