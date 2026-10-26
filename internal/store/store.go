@@ -1241,13 +1241,8 @@ func updateLicenseAndSubscriptionIn(ctx context.Context, tx bun.Tx, lic *model.L
 		return ErrLicenseRestricted
 	}
 
-	// Sync subscription status if one exists
-	if _, err := tx.NewRaw(`
-		UPDATE subscriptions SET status = ?, updated_at = now()
-		WHERE license_id = ? AND status != ?
-	`, lic.Status, lic.ID, lic.Status).Exec(ctx); err != nil {
-		// Non-fatal: subscription may not exist
-		slog.Warn("sync subscription status failed", "license_id", lic.ID, "error", err)
+	if err := syncSubscriptionStatus(ctx, tx, lic.ID, lic.Status); err != nil {
+		return err
 	}
 	// The subscription row names the plan too; a plan the licence moved
 	// to in Stripe moves it with the licence, or the two disagree.

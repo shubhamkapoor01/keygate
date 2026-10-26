@@ -3,6 +3,8 @@ package store_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -266,5 +268,34 @@ func TestStripeWritesRespectLicenceState(t *testing.T) {
 	}
 	if st, _, _ := state(canceled); st != model.StatusActive {
 		t.Fatalf("current read did not restore the unpaid-canceled licence: %s", st)
+	}
+}
+
+// A failed update of the subscription row fails the write: the transaction
+// is aborted, so the licence update is rolled back with it.
+func TestUpdateLicenseFromSubscriptionEnded_FailedSubscriptionSync(t *testing.T) {
+	s := setupTestDB(t)
+	t.Cleanup(func() { s.Close() })
+	ctx := context.Background()
+	lic := newLicenseOn(t, s, ctx, "subscription", model.StatusActive, nil)
+	sub := "sub_end_" + lic.ID
+	linkSubscription(t, s, ctx, lic.ID, sub)
+
+	fn := "fail_sub_" + strings.ReplaceAll(lic.ID, "-", "")
+	if _, err := s.DB.ExecContext(ctx, fmt.Sprintf(`CREATE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN RAISE EXCEPTION 'database unavailable'; END $$`, fn)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = s.DB.ExecContext(context.Background(), fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON subscriptions", fn))
+		_, _ = s.DB.ExecContext(context.Background(), fmt.Sprintf("DROP FUNCTION IF EXISTS %s()", fn))
+	})
+	if _, err := s.DB.ExecContext(ctx, fmt.Sprintf(`CREATE TRIGGER %s BEFORE UPDATE ON subscriptions FOR EACH ROW
+		WHEN (NEW.license_id = '%s') EXECUTE FUNCTION %s()`, fn, lic.ID, fn)); err != nil {
+		t.Fatal(err)
+	}
+	err := s.UpdateLicenseFromSubscriptionEnded(ctx, &model.License{ID: lic.ID, StripeSubscriptionID: sub, Status: model.StatusCanceled}, time.Now(), "status")
+	if st, _ := licenseState(t, s, ctx, lic.ID); !strings.Contains(fmt.Sprint(err), "database unavailable") || st != model.StatusActive {
+		t.Fatalf("subscription update failed: err=%v, licence %s; want the trigger's error and the licence still active", err, st)
 	}
 }
