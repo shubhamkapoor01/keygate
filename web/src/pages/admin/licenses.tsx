@@ -1198,14 +1198,15 @@ function UsageTab({ licenseId }: { licenseId: string }) {
     queryFn: () => admin.getLicenseUsage(licenseId, pg.params),
   })
 
-  // confirmResetUsage holds the feature name pending confirmation.
+  // confirmResetUsage holds the counter row pending confirmation.
   // Reset is destructive: it zeroes the counter for the live period,
   // which most plans will treat as "free re-use until the next
   // reset" — a stray click can effectively grant the customer free
   // usage. The AlertDialog forces an intentional click.
-  const [confirmResetUsage, setConfirmResetUsage] = useState<string | null>(null)
+  const [confirmResetUsage, setConfirmResetUsage] = useState<{ feature: string; period: string } | null>(null)
   const resetMut = useMutation({
-    mutationFn: (feature: string) => admin.resetUsageCounter(licenseId, { feature }),
+    mutationFn: (c: { feature: string; period: string }) =>
+      admin.resetUsageCounter(licenseId, { feature: c.feature, period: c.period }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["admin", "license-usage", licenseId] })
       setConfirmResetUsage(null)
@@ -1253,8 +1254,8 @@ function UsageTab({ licenseId }: { licenseId: string }) {
                       size="icon"
                       className="h-7 w-7"
                       title={t("licenses.resetCounter")}
-                      onClick={() => setConfirmResetUsage(c.feature)}
-                      disabled={resetMut.isPending && resetMut.variables === c.feature}
+                      onClick={() => setConfirmResetUsage(c)}
+                      disabled={resetMut.isPending && resetMut.variables === c}
                     >
                       <RefreshCw className="h-3 w-3" />
                     </Button>
@@ -1311,7 +1312,9 @@ function UsageTab({ licenseId }: { licenseId: string }) {
       <AlertDialog open={!!confirmResetUsage} onOpenChange={() => setConfirmResetUsage(null)}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>{t("licenses.resetCounterTitle", { feature: confirmResetUsage || "" })}</AlertDialogTitle>
+            <AlertDialogTitle>
+              {t("licenses.resetCounterTitle", { feature: confirmResetUsage?.feature || "" })}
+            </AlertDialogTitle>
             <AlertDialogDescription>{t("licenses.resetCounterDesc")}</AlertDialogDescription>
           </AlertDialogHeader>
           <div className="flex justify-end gap-2">
