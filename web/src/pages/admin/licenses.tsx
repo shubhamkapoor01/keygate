@@ -63,7 +63,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { type TranslationKeys, useI18n } from "@/i18n"
-import { type AdminSeat, admin, errorCode, errorDetails, type License, type Plan } from "@/lib/api"
+import { type AdminSeat, admin, errorCode, errorDetails, type License, type Plan, type UsageCounter } from "@/lib/api"
 import { formatDate, maskKey, statusColor } from "@/lib/utils"
 
 // A date picked in the expiry field means "valid through that whole
@@ -1203,10 +1203,10 @@ function UsageTab({ licenseId }: { licenseId: string }) {
   // which most plans will treat as "free re-use until the next
   // reset" — a stray click can effectively grant the customer free
   // usage. The AlertDialog forces an intentional click.
-  const [confirmResetUsage, setConfirmResetUsage] = useState<{ feature: string; period: string } | null>(null)
+  const [confirmResetUsage, setConfirmResetUsage] = useState<UsageCounter | null>(null)
   const resetMut = useMutation({
-    mutationFn: (c: { feature: string; period: string }) =>
-      admin.resetUsageCounter(licenseId, { feature: c.feature, period: c.period }),
+    mutationFn: (c: UsageCounter) =>
+      admin.resetUsageCounter(licenseId, { feature: c.feature, period: c.period, period_key: c.period_key }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["admin", "license-usage", licenseId] })
       setConfirmResetUsage(null)
