@@ -784,6 +784,7 @@ func main() {
 
 		// Read / pure-status endpoints — no idempotency layer needed.
 		lic.POST("/verify", licenseH.Verify)
+		lic.POST("/refresh", licenseH.Refresh)
 		lic.POST("/deactivate", licenseH.Deactivate)
 		lic.POST("/entitlements", entitlementH.Check)
 		lic.POST("/usage/status", usageH.GetQuotaStatus)

@@ -345,10 +345,15 @@ func (s *LicenseService) Verify(ctx context.Context, in VerifyInput) (*VerifyRes
 		// oracle: 403 NOT_ACTIVATED tells the attacker a key is real.
 		return nil, licenseNotFound()
 	}
+	return s.verified(ctx, lic, act, in.Identifier, in.IPAddress)
+}
+
+// verified answers a verify, or a refresh, that passed every check.
+func (s *LicenseService) verified(ctx context.Context, lic *model.License, act *model.Activation, identifier, ip string) (*VerifyResult, error) {
 	_ = s.store.TouchActivation(ctx, act.ID)
 
 	if s.failures != nil {
-		s.failures.RecordSuccess(middleware.FailureKeyIP(in.IPAddress))
+		s.failures.RecordSuccess(middleware.FailureKeyIP(ip))
 	}
 
 	planName := ""
@@ -358,7 +363,7 @@ func (s *LicenseService) Verify(ctx context.Context, in VerifyInput) (*VerifyRes
 
 	middleware.LicenseVerifications.WithLabelValues(lic.ProductID, "valid").Inc()
 
-	token, features, err := s.signToken(ctx, lic, in.Identifier)
+	token, features, err := s.signToken(ctx, lic, identifier)
 	if err != nil {
 		return nil, apperr.Internal(err)
 	}
@@ -390,6 +395,75 @@ func refuseFloating(lic *model.License) error {
 			"this license is floating: check out a seat with /license/floating/checkout instead")
 	}
 	return nil
+}
+
+// ─── Refresh ───
+
+// refreshClockSlack is how much earlier than its device's activation a
+// token may say it was issued: the activation's time comes from the
+// database's clock, the token's from this server's.
+const refreshClockSlack = time.Minute
+
+type RefreshInput struct {
+	Token      string
+	Identifier string
+	IPAddress  string
+}
+
+// Refresh is Verify for a client that holds its signed token rather
+// than the key. The token must be genuine, unexpired, this device's, and
+// issued since the device was last activated, so releasing the device,
+// rotating the key or removing the member ends the tokens issued before.
+// The licence is then judged as the key that activated the device would
+// be on Verify, and every refusal answers as Verify's do.
+func (s *LicenseService) Refresh(ctx context.Context, in RefreshInput) (*VerifyResult, error) {
+	if s.failures != nil {
+		if blocked, retryAfter := s.failures.IsBlocked(middleware.FailureKeyIP(in.IPAddress)); blocked {
+			return nil, lockedOut(retryAfter)
+		}
+	}
+	refuse := func() (*VerifyResult, error) {
+		if locked := s.recordFailure(in.IPAddress); locked != nil {
+			return nil, locked
+		}
+		return nil, licenseNotFound()
+	}
+
+	tok, err := license.Verify(in.Token, s.SigningPublicKey())
+	if err != nil || tok.Identifier != in.Identifier {
+		return refuse()
+	}
+	act, err := s.store.FindActivation(ctx, tok.LicenseID, tok.Identifier)
+	if errors.Is(err, sql.ErrNoRows) {
+		return refuse()
+	}
+	if err != nil {
+		return nil, apperr.Internal(err)
+	}
+	if time.Unix(tok.IssuedAt, 0).Add(refreshClockSlack).Before(act.CreatedAt) {
+		return refuse()
+	}
+	lic, err := s.store.FindLicenseForActivation(ctx, act)
+	if errors.Is(err, sql.ErrNoRows) {
+		return refuse()
+	}
+	if err != nil {
+		return nil, apperr.Internal(err)
+	}
+	if lic.ProductID != tok.ProductID {
+		return refuse()
+	}
+	if err := requireProductCapability(lic.Product, model.CapActivations, "device verification"); err != nil {
+		return nil, err
+	}
+	if firstErr(s.assertUsable(lic), seatPaused(lic)) != nil {
+		middleware.LicenseVerifications.WithLabelValues(lic.ProductID, "unusable").Inc()
+		return refuse()
+	}
+	if err := refuseFloating(lic); err != nil {
+		return nil, err
+	}
+	return s.verified(ctx, lic, act, in.Identifier, in.IPAddress)
 }
 
 // ─── Deactivate ───

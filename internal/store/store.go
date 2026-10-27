@@ -884,24 +884,44 @@ func (s *Store) FindLicenseByKey(ctx context.Context, key string) (*model.Licens
 		Where("member_key_hash = ? AND removed_at IS NULL AND accepted_at IS NOT NULL", keyHash).
 		Scan(ctx)
 	if err == nil {
-		l, err := s.findLicenseWhere(ctx, "license.id = ?", seat.LicenseID)
-		if err != nil {
-			return l, err
-		}
-		if l.Product == nil || !model.ProductSupports(l.Product.Type, model.CapSeats) {
-			return nil, sql.ErrNoRows
-		}
-		if l.KeySeatPaused, err = s.SeatPaused(ctx, seat.ID); err != nil {
-			return nil, err
-		}
-		l.KeySeat = seat
-		return l, nil
+		return s.licenseForSeat(ctx, seat)
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
 	// Fallback to plaintext for un-migrated keys.
 	return s.findLicenseWhere(ctx, "license.license_key = ?", key)
+}
+
+// FindLicenseForActivation finds the licence a device is activated on,
+// as the key that activated it opens it: the licence's own, or the
+// member's whose seat the device is on (see FindLicenseByKey).
+func (s *Store) FindLicenseForActivation(ctx context.Context, act *model.Activation) (*model.License, error) {
+	if act.SeatID == "" {
+		return s.findLicenseWhere(ctx, "license.id = ?", act.LicenseID)
+	}
+	seat := new(model.Seat)
+	if err := s.DB.NewSelect().Model(seat).
+		Where("id = ? AND license_id = ? AND removed_at IS NULL AND accepted_at IS NOT NULL", act.SeatID, act.LicenseID).
+		Scan(ctx); err != nil {
+		return nil, err
+	}
+	return s.licenseForSeat(ctx, seat)
+}
+
+func (s *Store) licenseForSeat(ctx context.Context, seat *model.Seat) (*model.License, error) {
+	l, err := s.findLicenseWhere(ctx, "license.id = ?", seat.LicenseID)
+	if err != nil {
+		return l, err
+	}
+	if l.Product == nil || !model.ProductSupports(l.Product.Type, model.CapSeats) {
+		return nil, sql.ErrNoRows
+	}
+	if l.KeySeatPaused, err = s.SeatPaused(ctx, seat.ID); err != nil {
+		return nil, err
+	}
+	l.KeySeat = seat
+	return l, nil
 }
 
 func (s *Store) findLicenseWhere(ctx context.Context, where string, arg any) (*model.License, error) {

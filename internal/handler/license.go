@@ -115,6 +115,32 @@ func (h *LicenseHandler) Verify(c *gin.Context) {
 	response.OK(c, result)
 }
 
+func (h *LicenseHandler) Refresh(c *gin.Context) {
+	var req struct {
+		Token      string `json:"token" binding:"required"`
+		Identifier string `json:"identifier" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "token and identifier are required")
+		return
+	}
+	var ok bool
+	if req.Identifier, ok = cleanIdentifier(c, req.Identifier); !ok {
+		return
+	}
+
+	result, err := h.svc.Refresh(c.Request.Context(), service.RefreshInput{
+		Token:      req.Token,
+		Identifier: req.Identifier,
+		IPAddress:  c.ClientIP(),
+	})
+	if err != nil {
+		writeAppErr(c, err)
+		return
+	}
+	response.OK(c, result)
+}
+
 func (h *LicenseHandler) Deactivate(c *gin.Context) {
 	var req struct {
 		LicenseKey string `json:"license_key" binding:"required"`

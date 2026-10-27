@@ -509,6 +509,58 @@ paths:
         "429":
           $ref: "#/components/responses/LicenseThrottled"
 
+  /license/refresh:
+    post:
+      tags: [License]
+      summary: Refresh a token without the license key
+      description: |
+        Verify for a client that holds its signed token rather than the
+        key: answers as `/license/verify` does, with a new token. The
+        token must verify, must not have expired, must be for this
+        identifier, and must have been issued since the device was last
+        activated, so releasing the device, rotating the key or removing
+        the member stops the tokens issued before. An expired token needs
+        the key again (`/license/verify`).
+
+        `identifier` is trimmed first; blank or longer than 256 bytes is
+        refused with 400.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, identifier]
+              properties:
+                token:
+                  type: string
+                identifier:
+                  type: string
+                  maxLength: 256
+      responses:
+        "200":
+          description: Verification result, with a new token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VerifyResponse"
+        "400":
+          description: "`BAD_REQUEST`: missing fields, blank or too long identifier"
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "404":
+          description: |
+            `LICENSE_NOT_FOUND`: one answer for a token that doesn't
+            verify, has expired or is another device's, a device no
+            longer activated or activated again since the token, and a
+            license `/license/verify` would refuse. `FEATURE_NOT_AVAILABLE`
+            for a SaaS product.
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "409":
+          description: "`FLOATING_LICENSE`: the plan is floating, as on `/license/verify`."
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "429":
+          $ref: "#/components/responses/LicenseThrottled"
+
   /license/deactivate:
     post:
       tags: [License]
