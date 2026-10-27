@@ -388,10 +388,10 @@ func (h *StripeHandler) Webhook(c *gin.Context) {
 
 	slog.Info("stripe webhook received", "type", event.Type, "id", event.ID)
 
-	// Handlers that talk to Stripe report transient failures; the
-	// event claim is then released and Stripe asked to retry, so a
-	// lookup that failed once does not mean a paid customer without a
-	// license or a refunded one that stays active.
+	// Handlers report transient failures, of Stripe or of the database;
+	// the event claim is then released and Stripe asked to retry, so a
+	// lookup or write that failed once does not mean a paid customer
+	// without a license or a refunded one that stays active.
 	var herr error
 	switch event.Type {
 	case "checkout.session.completed", "checkout.session.async_payment_succeeded":
@@ -1715,8 +1715,19 @@ func (e *subscriptionEvent) PeriodEnd() int64 {
 // downstream system revokes access the database still grants.
 //
 // A write that failed, rather than one refused as unlinked, stale or
-// restricted, also returns its error; a webhook handler returns it, so
-// Stripe retries the event.
+// restricted, also returns its error when it came from a current read
+// (asOf set); a webhook handler returns it, so Stripe retries the
+// event, and the retry reads the subscription afresh. A write from an
+// event's payload alone is not retried: Stripe retries for days and in
+// no particular order, and a pause retried after the resume, or a
+// failed payment after the invoice was paid, would suspend or dun a
+// customer who is paying. Losing it costs less: the
+// customer.subscription.updated Stripe sends alongside sets past_due or
+// active again, a lost pause leaves the licence usable, and a lost
+// payment_failed leaves its notice to Stripe's next attempt. A failure
+// before the write (the lookup, the read stamp) is still retried, and
+// on an install that cannot read Stripe that retry writes its payload
+// late; that is rare, and accepted.
 //
 // asOf, when set, is the StripeReadStamp taken before the Stripe read the
 // write comes from: a newer read already applied wins, and this one is
@@ -1728,12 +1739,17 @@ func (h *StripeHandler) applyLicenseFromSubscription(ctx context.Context, lic *m
 	} else {
 		err = h.Store.UpdateLicenseFromSubscription(ctx, lic, cols...)
 	}
-	return h.subscriptionWriteLanded(lic, event, err)
+	landed, err := h.subscriptionWriteLanded(lic, event, err)
+	if asOf == nil {
+		err = nil // from a payload: not retried, see above
+	}
+	return landed, err
 }
 
 // subscriptionWriteLanded reports whether a write from a subscription
 // event landed, logging why when it did not (see
-// applyLicenseFromSubscription).
+// applyLicenseFromSubscription). The error is set only for a write that
+// failed; a refused one returns false and nil.
 func (h *StripeHandler) subscriptionWriteLanded(lic *model.License, event string, err error) (bool, error) {
 	if errors.Is(err, store.ErrSubscriptionUnlinked) {
 		slog.Info("stripe webhook: license was unlinked from this subscription, event ignored",
@@ -1760,7 +1776,9 @@ func (h *StripeHandler) subscriptionWriteLanded(lic *model.License, event string
 
 // endLicenseFromSubscription is applyLicenseFromSubscription for a
 // subscription that is over (see store.UpdateLicenseFromSubscriptionEnded).
-// Callers must stop on false, for the same reason.
+// Callers must stop on false, for the same reason. A failed write is
+// always retried: Stripe never revives an ended subscription, so a late
+// retry has no newer state to undo, and no later event ends the licence.
 func (h *StripeHandler) endLicenseFromSubscription(ctx context.Context, lic *model.License, cols ...string) (bool, error) {
 	asOf, err := h.Store.StripeReadStamp(ctx)
 	if err == nil {
@@ -1914,8 +1932,10 @@ func (h *StripeHandler) syncFromCurrent(ctx context.Context, lic *model.License,
 // data is an event payload. The write checks the licence's own state
 // (store.ErrLicenseRestricted): nothing here undoes an operator's
 // suspension or revocation, or revives an ended subscription from a
-// payload. An error is returned only when an upgraded licence could not
-// be put back on its free plan; the event is then retried.
+// payload. An error means the event is to be retried, for instance
+// when the licence write from a current read failed, an upgraded
+// licence could not be put back on its free plan, or a downgrade still
+// holds the plan and seats.
 func (h *StripeHandler) applySubscriptionState(ctx context.Context, lic *model.License, data *subscriptionEvent, readAt *time.Time, event string) error {
 	termsHeld := false
 	// Capture the prior state BEFORE mutating — recovery side-effects
@@ -2014,7 +2034,7 @@ func (h *StripeHandler) applySubscriptionState(ctx context.Context, lic *model.L
 			// rest goes on, and the event is asked for again at the end.
 			termsHeld, err = true, nil
 		}
-		landed, _ := h.subscriptionWriteLanded(lic, event, err)
+		landed, werr := h.subscriptionWriteLanded(lic, event, err)
 		// The plan and seats are announced when they moved, a suspended
 		// licence's included (see the store's write).
 		if written {
@@ -2024,9 +2044,8 @@ func (h *StripeHandler) applySubscriptionState(ctx context.Context, lic *model.L
 			// A write that failed (not one refused as stale, unlinked or
 			// restricted) is asked for again: the event is retried, as
 			// nothing else may bring these seats back in line.
-			if err != nil && !errors.Is(err, store.ErrSubscriptionUnlinked) &&
-				!errors.Is(err, store.ErrStaleSubscriptionRead) && !errors.Is(err, store.ErrLicenseRestricted) {
-				return fmt.Errorf("license %s: %w", lic.ID, err)
+			if werr != nil {
+				return fmt.Errorf("license %s: %w", lic.ID, werr)
 			}
 			return nil
 		}
@@ -2107,8 +2126,13 @@ func (h *StripeHandler) onSubscriptionDeleted(ctx context.Context, raw json.RawM
 	}
 
 	lic, err := h.Store.FindLicenseByStripeSubscription(ctx, data.ID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil // not one of ours (or already unlinked)
+	}
 	if err != nil {
-		return nil
+		// No later event ends this licence: a lookup that failed is
+		// retried, not taken as "not ours".
+		return err
 	}
 	// An upgraded licence goes back to the free plan it came from; a
 	// failure is retried rather than ending the licence on the paid plan.
