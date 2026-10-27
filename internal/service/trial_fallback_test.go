@@ -3,6 +3,7 @@ package service
 import (
 	"bufio"
 	"context"
+	"crypto/ed25519"
 	"log/slog"
 	"net"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tabloy/keygate/internal/license"
 	"github.com/tabloy/keygate/internal/model"
 	"github.com/tabloy/keygate/internal/store"
 )
@@ -574,7 +576,8 @@ func TestTrialFallback_FailedMoveIsRetriedNotExpired(t *testing.T) {
 
 // A trial that will move to a fallback is not read as expired before the
 // sweep moves it, even on a plan with no grace: it keeps a day. One with
-// no fallback, or billed by Stripe, ends on the plan's own grace.
+// no fallback ends at its end date; one billed by Stripe keeps the plan's
+// own grace.
 func TestTrialFallback_UsableUntilTheSweepMovesIt(t *testing.T) {
 	f := newFallbackFixture(t)
 	if _, err := f.s.DB.NewUpdate().Model((*model.Plan)(nil)).Set("grace_days = 0").
@@ -619,5 +622,50 @@ func TestTrialFallback_NamedSinceTheReadIsTaken(t *testing.T) {
 	f.c.endTrial(f.ctx, lic)
 	if got := f.load(lic); got.Status != model.StatusActive || got.PlanID != f.free.ID {
 		t.Fatalf("licence is %s on %s, want it moved to the fallback named since", got.Status, got.PlanID)
+	}
+}
+
+// A trial Stripe doesn't bill, on a plan with no fallback, gets no grace
+// days from verify or in its token: the sweep ends it at its end date.
+func TestTrialNotBilledByStripe_EndsAtItsEndDate(t *testing.T) {
+	f := newFallbackFixture(t)
+	if _, err := f.s.DB.NewUpdate().Model((*model.Plan)(nil)).Set("grace_days = 7").
+		Where("id = ?", f.bare.ID).Exec(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	lic := f.license(f.bare)
+	in := VerifyInput{LicenseKey: lic.LicenseKey}
+	if err := f.s.DB.NewRaw("SELECT identifier FROM activations WHERE license_id = ?", lic.ID).Scan(f.ctx, &in.Identifier); err != nil {
+		t.Fatal(err)
+	}
+	priv := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
+	svc := NewLicenseService(f.s, priv, slog.Default(), nil, nil)
+
+	// A day left: the token stops at the trial's end.
+	end := time.Now().Add(24 * time.Hour).Truncate(time.Second)
+	if _, err := f.s.DB.NewUpdate().Model((*model.License)(nil)).Set("valid_until = ?", end).
+		Where("id = ?", lic.ID).Exec(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	res, err := svc.Verify(f.ctx, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok, err := license.Verify(res.Token, license.PublicKey(priv))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exp := time.Unix(tok.ExpiresAt, 0); !exp.Equal(end) || tok.GraceDays != 0 || res.GraceDays != 0 {
+		t.Errorf("grace_days %d, token grc %d and good offline %s past the trial's end; want none",
+			res.GraceDays, tok.GraceDays, exp.Sub(end))
+	}
+
+	// Back to its end a minute ago, before the sweep has run.
+	if _, err := f.s.DB.NewUpdate().Model((*model.License)(nil)).Set("valid_until = ?", lic.ValidUntil).
+		Where("id = ?", lic.ID).Exec(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Verify(f.ctx, in); err == nil {
+		t.Error("verify answered a minute after the trial ended")
 	}
 }

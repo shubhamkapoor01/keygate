@@ -315,7 +315,7 @@ func TestEffectiveGraceDays(t *testing.T) {
 	plan := &model.Plan{GraceDays: 7}
 
 	for _, status := range []string{model.StatusActive, model.StatusTrialing, model.StatusPastDue} {
-		lic := &model.License{Status: status, Plan: plan}
+		lic := &model.License{Status: status, Plan: plan, StripeSubscriptionID: "sub_test"}
 		if got := svc.effectiveGraceDays(lic); got != 7 {
 			t.Errorf("%s: grace = %d, want the plan's 7", status, got)
 		}
@@ -326,6 +326,11 @@ func TestEffectiveGraceDays(t *testing.T) {
 	lic := &model.License{Status: model.StatusCanceled, Plan: plan}
 	if got := svc.effectiveGraceDays(lic); got != 0 {
 		t.Errorf("canceled: grace = %d, want 0", got)
+	}
+
+	lic = &model.License{Status: model.StatusTrialing, Plan: plan}
+	if got := svc.effectiveGraceDays(lic); got != 0 {
+		t.Errorf("trialing, not billed by Stripe: grace = %d, want 0", got)
 	}
 }
 

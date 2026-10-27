@@ -739,11 +739,12 @@ function SeatsSection({ license, onAddSeats }: { license: PortalLicense; onAddSe
   // (LicenseUsable): an active one up to its end plus the plan's grace
   // days, a canceled one up to its end. The team is still listed, and
   // members removed, whatever its state. A trial that moves to its
-  // plan's fallback when it ends keeps at least a day (License.GraceDays).
+  // plan's fallback when it ends keeps at least a day, and any other
+  // trial Stripe doesn't bill has none (License.GraceDays).
   const until = license.valid_until ? new Date(license.valid_until).getTime() : null
   let graceDays = license.plan?.grace_days ?? 7
-  if (license.status === "trialing" && license.plan?.trial_fallback_plan_id && !license.stripe_subscription_id) {
-    graceDays = Math.max(graceDays, 1)
+  if (license.status === "trialing" && license.plan && !license.stripe_subscription_id) {
+    graceDays = license.plan.trial_fallback_plan_id ? Math.max(graceDays, 1) : 0
   }
   const graceMs = graceDays * 24 * 60 * 60 * 1000
   const inUse =

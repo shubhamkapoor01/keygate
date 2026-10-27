@@ -1021,7 +1021,7 @@ paths:
 
         All failure modes (unknown / expired / removed / already
         accepted token, or a license not usable now: suspended, revoked
-        or expired, past its end plus the plan's grace days, or canceled
+        or expired, past its end plus its grace days, or canceled
         and past its end; the rule an invite is held to) collapse to one
         opaque `404 SEAT_INVITE_INVALID` so an attacker can't probe token
         validity by response shape. When a policy check fails (e.g.
@@ -6518,7 +6518,7 @@ components:
                 | `iat`, `exp` | issued at; how long the client may stay offline before verifying again. `exp` is a check-in interval, not the license term, and never later than `vun` plus grace |
                 | `vun` | when the license itself lapses; absent = no expiry |
                 | `upd` | end of the maintenance period: install only releases published at or before this instant; absent = no separate limit |
-                | `grc` | grace days after `vun` (at least 1 for a trial whose plan names a fallback plan and that Stripe does not bill, until it moves) |
+                | `grc` | grace days after `vun` (0 for a trial that Stripe does not bill and whose plan names no fallback plan; at least 1 for one whose plan does, until it moves) |
                 | `nce` | per-issuance nonce |
 
                 A client that ships updates through its own channel
@@ -6527,7 +6527,7 @@ components:
                 the same rule when given the license token or key.
             grace_days:
               type: integer
-              description: Grace days after `valid_until`; 0 for a canceled license; at least 1 for a trial whose plan names a fallback plan (`trial_fallback_plan_id`) and that Stripe does not bill, until it moves.
+              description: Grace days after `valid_until`; 0 for a canceled license, or for a trial that Stripe does not bill and whose plan names no fallback plan; at least 1 for a trial whose plan names a fallback plan (`trial_fallback_plan_id`) and that Stripe does not bill, until it moves.
             external_customer_id:
               type: string
               description: Echoed when the license was created with one, so the client can check it belongs to the expected customer. Absent otherwise.

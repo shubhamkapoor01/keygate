@@ -502,12 +502,16 @@ type License struct {
 // moves it, and until then it must not read as expired, as it would on
 // a plan with no grace. A trial Stripe bills is Stripe's to settle and
 // keeps the plan's number.
+// Any other trial has none: the sweep expires it at its end date.
 func (l *License) GraceDays() int {
 	if l.Plan == nil {
 		return 7
 	}
 	if l.Status == StatusTrialing && l.Plan.TrialFallbackPlanID != "" && l.StripeSubscriptionID == "" {
 		return max(l.Plan.GraceDays, 1)
+	}
+	if l.Status == StatusTrialing && l.StripeSubscriptionID == "" {
+		return 0
 	}
 	return l.Plan.GraceDays
 }
