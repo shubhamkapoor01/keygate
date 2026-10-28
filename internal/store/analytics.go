@@ -520,9 +520,23 @@ func (s *Store) GetGrowthMetrics(ctx context.Context, productID string) (*Growth
 		gm.NetGrowthRate = float64(newCount-churnedCount) / float64(total) * 100
 	}
 
+	// A trial converted when an upgrade from a trial plan was paid for
+	// and applied, whatever the licence's state now (one refunded and
+	// undone did not), or when the trial plan is itself sold through
+	// Stripe and its first charge made it active. Trials are the licences on a trial plan now, plus
+	// those that left one: converted, or moved off it (to the plan a
+	// trial falls back to, or by an operator), as their plan_changed
+	// audit lines record. A trial plan deleted takes its history out
+	// of both.
+	const trialPlans = `SELECT id FROM plans WHERE license_type = 'trial'`
+	const converted = `SELECT u.license_id FROM license_upgrades AS u
+		WHERE u.state = 'applied' AND u.from_plan_id IN (` + trialPlans + `)`
+	const leftTrial = `SELECT a.entity_id FROM audit_logs AS a
+		WHERE a.entity = 'license' AND a.action = 'plan_changed'
+		AND a.changes->>'old_plan_id' IN (` + trialPlans + `)`
+
 	ttq := s.DB.NewSelect().TableExpr("licenses AS l").
-		Join("JOIN plans AS p ON p.id = l.plan_id").
-		Where("p.license_type = 'trial'")
+		Where("(l.plan_id IN (" + trialPlans + ") OR l.id IN (" + converted + ") OR l.id IN (" + leftTrial + "))")
 	if productID != "" {
 		ttq = ttq.Where("l.product_id = ?", productID)
 	}
@@ -533,9 +547,7 @@ func (s *Store) GetGrowthMetrics(ctx context.Context, productID string) (*Growth
 	gm.TotalTrials = totalTrials
 
 	ctq := s.DB.NewSelect().TableExpr("licenses AS l").
-		Join("JOIN plans AS p ON p.id = l.plan_id").
-		Where("p.license_type = 'trial'").
-		Where("l.status = 'active'")
+		Where("(l.id IN (" + converted + ") OR (l.plan_id IN (" + trialPlans + ") AND l.status = 'active'))")
 	if productID != "" {
 		ctq = ctq.Where("l.product_id = ?", productID)
 	}

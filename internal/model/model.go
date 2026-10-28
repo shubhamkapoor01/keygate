@@ -494,10 +494,11 @@ type License struct {
 	// Seat.Paused), so the member's key opens the licence but may not be
 	// used. Shown to that member in the portal.
 	KeySeatPaused bool `bun:"-" json:"key_paused,omitempty"`
-	// WasStripePaused and WasCanceled are the row as the last
+	// WasStripePaused, WasCanceled and WasExpired are the row as the last
 	// subscription-driven write found it, under the lock it held until
 	// commit (store.updateLicenseAndSubscriptionIn): a write that made it
-	// usable ended a Stripe pause, one that canceled it ended the licence.
+	// usable ended a Stripe pause or brought an ended licence back, one
+	// that canceled it ended the licence.
 	// Concurrent events cannot both find the same state, so each change
 	// is told once.
 	WasStripePaused bool `bun:"-" json:"-"`
@@ -506,6 +507,9 @@ type License struct {
 	WasPastDue     bool       `bun:"-" json:"-"`
 	PriorPastDueAt *time.Time `bun:"-" json:"-"`
 	WasCanceled    bool       `bun:"-" json:"-"`
+	WasExpired     bool       `bun:"-" json:"-"`
+	// Whether the row was revoked already: a revocation is told once.
+	WasRevoked bool `bun:"-" json:"-"`
 }
 
 // GraceDays is how many days past ValidUntil the licence's key keeps
@@ -897,48 +901,63 @@ func (r *LicenseRenewal) Counts() bool { return r.RefundedAt == nil && r.Updates
 // refund lands on the dates a customer who never bought the refunded
 // renewal would have, in whatever order refunds arrive.
 //
-// Two cursors walk the rows oldest first. observed is the end the
-// license had at each point, counting renewals that were later
-// refunded, because they were in effect when the next one was bought.
-// net is the same walk without refunded renewals; it is the answer.
+// Each row records the end the license had when it was bought. The
+// replay predicts that end from the rows before it: every renewal that
+// was in effect then, so one refunded later still counts, and one
+// refunded earlier does not, as its refund had already taken it back
+// out. The answer is the walk of every row without the refunded ones.
 //
-// A row whose recorded previous end is not what observed predicts
+// A row whose recorded previous end is not what the replay predicts
 // marks a change made outside the ledger, an admin edit. It is
-// carried as an offset rather than a new baseline: resetting net to
-// the edited date would fold every earlier renewal into it, and
-// refunding one of those would then give the money back without
-// taking the days. Applying the difference keeps both properties —
-// the edit survives, and a refund removes exactly its own renewal.
-// Only a move to or from "updates for life" cannot be expressed as
-// an offset, and there both cursors restart.
+// carried as an offset rather than a new baseline: resetting to the
+// edited date would fold every earlier renewal into it, and refunding
+// one of those would then give the money back without taking the
+// days. Applying the difference keeps both properties — the edit
+// survives, and a refund removes exactly its own renewal. Only a move
+// to or from "updates for life" cannot be expressed as an offset, and
+// there the walk restarts from the recorded end.
 func ReplayRenewals(renewals []*LicenseRenewal) *time.Time {
-	var observed, net *time.Time
+	// What happened outside the ledger just before each row: a restart
+	// from its recorded end, or an admin edit carried as a shift.
+	type outside struct {
+		restart bool
+		shift   time.Duration
+	}
+	before := make([]outside, len(renewals))
+	// walk replays the first n rows, the outside changes included, each
+	// adding its days when counts says it was in effect.
+	walk := func(n int, counts func(*LicenseRenewal) bool) *time.Time {
+		var end *time.Time
+		for k, r := range renewals[:n] {
+			switch o := before[k]; {
+			case o.restart:
+				end = r.PreviousUpdatesUntil
+			case o.shift != 0 && end != nil:
+				shifted := end.Add(o.shift)
+				end = &shifted
+			}
+			if r.UpdatesUntil != nil && counts(r) { // nil: changed nothing when applied
+				renewed := RenewedUpdatesUntil(end, r.CreatedAt, r.Days)
+				end = &renewed
+			}
+		}
+		return end
+	}
 	for i, r := range renewals {
+		predicted := walk(i, func(p *LicenseRenewal) bool {
+			return p.RefundedAt == nil || !p.RefundedAt.Before(r.CreatedAt)
+		})
 		switch {
-		case i == 0 || SameEnd(r.PreviousUpdatesUntil, observed):
-			if i == 0 {
-				observed, net = r.PreviousUpdatesUntil, r.PreviousUpdatesUntil
-			}
-		case r.PreviousUpdatesUntil == nil || observed == nil:
-			observed, net = r.PreviousUpdatesUntil, r.PreviousUpdatesUntil
+		case i == 0:
+			before[i].restart = true
+		case SameEnd(r.PreviousUpdatesUntil, predicted):
+		case r.PreviousUpdatesUntil == nil || predicted == nil:
+			before[i].restart = true
 		default:
-			if net != nil {
-				shifted := net.Add(r.PreviousUpdatesUntil.Sub(*observed))
-				net = &shifted
-			}
-			observed = r.PreviousUpdatesUntil
-		}
-		if r.UpdatesUntil == nil {
-			continue // changed nothing when applied
-		}
-		end := RenewedUpdatesUntil(observed, r.CreatedAt, r.Days)
-		observed = &end
-		if r.RefundedAt == nil {
-			netEnd := RenewedUpdatesUntil(net, r.CreatedAt, r.Days)
-			net = &netEnd
+			before[i].shift = r.PreviousUpdatesUntil.Sub(*predicted)
 		}
 	}
-	return net
+	return walk(len(renewals), func(p *LicenseRenewal) bool { return p.RefundedAt == nil })
 }
 
 // SameEnd compares two optional instants that went through Postgres

@@ -29,6 +29,7 @@ type fakeSubscription struct {
 	unit        map[string]int64
 	balance     int64 // negative: credit
 	failPayment bool
+	canceled    int // DELETEs received
 	// pending is the change held until paid; nil when none.
 	pending *struct {
 		price    string
@@ -158,6 +159,10 @@ func (f *fakeSubscription) serve(t *testing.T) http.HandlerFunc {
 				hook()
 				f.mu.Lock()
 			}
+		case r.URL.Path == "/v1/subscriptions/"+f.id && r.Method == http.MethodDelete:
+			// Cancelling ends it at once, as Stripe's DELETE does.
+			f.status, f.canceled = "canceled", f.canceled+1
+			_, _ = w.Write([]byte(f.json(expand)))
 		case r.URL.Path == "/v1/subscriptions/"+f.id && r.Method == http.MethodPost:
 			if f.delay > 0 {
 				f.mu.Unlock()

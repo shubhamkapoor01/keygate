@@ -925,8 +925,10 @@ type chargeInvoice struct {
 // upgrade. An applied upgrade is reverted, one not yet applied is closed
 // so it never applies; for a subscription the subscription is cancelled
 // first. Reports whether the charge belonged to an upgrade at all, and
-// the charge's invoice if it had to look it up.
-func (h *StripeHandler) refundUpgrade(ctx context.Context, chargeID, paymentIntentID, invoiceID string, chargeMeta map[string]string) (bool, chargeInvoice, error) {
+// the charge's invoice if it had to look it up. refundedAt is
+// takeBackCharge's: 0 for a lost dispute, which ends the upgrade
+// whatever period it was over.
+func (h *StripeHandler) refundUpgrade(ctx context.Context, chargeID, paymentIntentID, invoiceID string, chargeMeta map[string]string, refundedAt int64) (bool, chargeInvoice, error) {
 	var u *model.LicenseUpgrade
 	var looked chargeInvoice
 	subscriptionID := ""
@@ -975,7 +977,9 @@ func (h *StripeHandler) refundUpgrade(ctx context.Context, chargeID, paymentInte
 		// A change made since the upgrade (more seats, say) is billed on
 		// its own invoice. Refunding that pays the change back; the
 		// upgrade, and the subscription, stand. The purchase path says so.
-		if changeOnly(inv) {
+		// A lost dispute over it (refundedAt 0) ends the billing, and so
+		// the upgrade, as any other.
+		if refundedAt != 0 && changeOnly(inv) {
 			return false, looked, nil
 		}
 		if inv != nil && inv.Parent != nil && inv.Parent.SubscriptionDetails != nil {
@@ -996,6 +1000,11 @@ func (h *StripeHandler) refundUpgrade(ctx context.Context, chargeID, paymentInte
 		}
 	}
 	if u == nil {
+		return false, looked, nil
+	}
+	// Found through an invoice for a period already over: that period,
+	// refunded, leaves the upgrade too. The purchase path says so.
+	if looked.looked && pastInvoice(looked.invoice, refundedAt) {
 		return false, looked, nil
 	}
 	if subscriptionID == "" {
@@ -1081,6 +1090,7 @@ func (h *StripeHandler) invoiceForCharge(invoiceID, paymentIntentID string) (*st
 			PaymentIntent: stripe.String(paymentIntentID),
 		},
 	}
+	params.Status = stripe.String("paid") // one payment may be tried against several invoices
 	params.AddExpand("data.invoice")
 	params.Filters.AddFilter("limit", "", "1")
 	iter := invoicepayment.List(params)

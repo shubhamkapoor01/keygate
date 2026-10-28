@@ -390,9 +390,15 @@ func TestChargeRefunded_SubscriptionViaInvoicePayments(t *testing.T) {
 		t.Fatalf("create other license: %v", err)
 	}
 
-	var hits int32
+	var hits, cancels int32
 	stubStripe(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/invoice_payments" || r.URL.Query().Get("payment[payment_intent]") != renewalPI || r.URL.Query().Get("payment[type]") != "payment_intent" {
+		if r.Method == http.MethodDelete && r.URL.Path == "/v1/subscriptions/"+subID {
+			atomic.AddInt32(&cancels, 1)
+			fmt.Fprintf(w, `{"id":%q,"object":"subscription","status":"canceled"}`, subID)
+			return
+		}
+		if r.URL.Path != "/v1/invoice_payments" || r.URL.Query().Get("payment[payment_intent]") != renewalPI || r.URL.Query().Get("payment[type]") != "payment_intent" ||
+			r.URL.Query().Get("status") != "paid" {
 			t.Errorf("unexpected Stripe call: %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
 			http.Error(w, `{"error":{"message":"unexpected"}}`, http.StatusNotFound)
 			return
@@ -416,6 +422,11 @@ func TestChargeRefunded_SubscriptionViaInvoicePayments(t *testing.T) {
 	other, _ := s.FindLicenseByID(ctx, otherLic.ID)
 	if other.Status != model.StatusActive {
 		t.Fatalf("unrelated license revoked: %s", other.Status)
+	}
+	// The refund does not end the subscription in Stripe: it is
+	// cancelled, so it stops billing the revoked licence.
+	if n := atomic.LoadInt32(&cancels); n != 1 {
+		t.Fatalf("subscription cancelled %d times, want once", n)
 	}
 }
 

@@ -1255,7 +1255,7 @@ function UsageTab({ licenseId }: { licenseId: string }) {
                       className="h-7 w-7"
                       title={t("licenses.resetCounter")}
                       onClick={() => setConfirmResetUsage(c)}
-                      disabled={resetMut.isPending && resetMut.variables === c}
+                      disabled={resetMut.isPending && resetMut.variables?.id === c.id}
                     >
                       <RefreshCw className="h-3 w-3" />
                     </Button>
@@ -1313,7 +1313,11 @@ function UsageTab({ licenseId }: { licenseId: string }) {
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>
-              {t("licenses.resetCounterTitle", { feature: confirmResetUsage?.feature || "" })}
+              {t("licenses.resetCounterTitle", {
+                feature: confirmResetUsage
+                  ? `${confirmResetUsage.feature} (${confirmResetUsage.period} ${confirmResetUsage.period_key})`
+                  : "",
+              })}
             </AlertDialogTitle>
             <AlertDialogDescription>{t("licenses.resetCounterDesc")}</AlertDialogDescription>
           </AlertDialogHeader>

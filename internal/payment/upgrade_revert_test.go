@@ -407,6 +407,77 @@ func TestUpgrade_SubscriptionRefundWithoutInvoiceField(t *testing.T) {
 	f.assertBackOnFree(t, sessionID, upgradeEndRefund)
 }
 
+// Refunding a period of the upgrade's subscription already over gives
+// that money back: the upgrade, the licence and the subscription carry
+// on.
+func TestUpgrade_PastPeriodRefundKeepsTheUpgrade(t *testing.T) {
+	f := newUpgradeFixture(t, "uppast")
+	sessionID, subID, pi := "cs_up_"+f.tag, "sub_up_"+f.tag, "pi_up_"+f.tag
+	f.applySub(t, sessionID, subID)
+	var cancels atomic.Int32
+	stubStripe(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/invoice_payments":
+			fmt.Fprintf(w, `{"object":"list","has_more":false,"url":"/v1/invoice_payments","data":[{"id":"inpay_%[1]s","object":"invoice_payment",
+				"invoice":{"id":"in_%[1]s","object":"invoice","parent":{"type":"subscription_details","subscription_details":{"subscription":"%[2]s","metadata":{}}},
+				"lines":{"object":"list","has_more":false,"data":[{"id":"il_%[1]s","object":"line_item","period":{"start":%[3]d,"end":%[4]d}}]}}}]}`,
+				f.tag, subID, time.Now().Add(-31*24*time.Hour).Unix(), time.Now().Add(-24*time.Hour).Unix())
+		case r.Method == http.MethodDelete:
+			cancels.Add(1)
+			fmt.Fprintf(w, `{"id":"%s","object":"subscription","status":"canceled"}`, subID)
+		default:
+			http.Error(w, `{"error":{"message":"unexpected `+r.Method+` `+r.URL.Path+`"}}`, http.StatusNotFound)
+		}
+	})
+	refund := fmt.Appendf(nil, `{"id":"ch_up_%s","payment_intent":"%s","customer":"cus_%s","refunded":true}`, f.tag, pi, f.tag)
+	if err := f.h.onChargeRefunded(f.ctx, refund); err != nil {
+		t.Fatalf("refund: %v", err)
+	}
+	if n := cancels.Load(); n != 0 {
+		t.Fatalf("subscription cancelled %d times for a past period's refund, want 0", n)
+	}
+	if _, err := f.s.FindAppliedUpgrade(f.ctx, f.lic.ID); err != nil {
+		t.Fatalf("upgrade no longer applied: %v", err)
+	}
+	if st := f.reload(t).Status; st == model.StatusRevoked {
+		t.Fatal("licence revoked for a past period's refund")
+	}
+	if n := auditCountAtLeast(f.s, f.ctx, f.lic.ID, "past_invoice_refunded", 1); n != 1 {
+		t.Fatalf("refund noted %d times, want once", n)
+	}
+}
+
+// A lost dispute over what a change to an upgrade's subscription cost
+// ends the subscription and puts the licence back on its free plan, as
+// any other takeback of an upgrade does; revoking would take the free
+// licence too.
+func TestUpgrade_LostDisputeOverAChangeRevertsTheUpgrade(t *testing.T) {
+	f := newUpgradeFixture(t, "updchg")
+	sessionID, subID, pi := "cs_dc_"+f.tag, "sub_dc_"+f.tag, "pi_dc_"+f.tag
+	f.applySub(t, sessionID, subID)
+	var cancels atomic.Int32
+	stubStripe(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/invoice_payments":
+			fmt.Fprintf(w, `{"object":"list","has_more":false,"url":"/v1/invoice_payments","data":[{"id":"inpay_%[1]s","object":"invoice_payment",
+				"invoice":{"id":"in_%[1]s","object":"invoice","billing_reason":"subscription_update","parent":{"type":"subscription_details","subscription_details":{"subscription":"%[2]s","metadata":{}}},
+				"lines":{"object":"list","has_more":false,"data":[{"id":"il_%[1]s","object":"line_item","parent":{"type":"subscription_item_details","subscription_item_details":{"proration":true}}}]}}}]}`, f.tag, subID)
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/subscriptions/"+subID:
+			cancels.Add(1)
+			fmt.Fprintf(w, `{"id":"%s","object":"subscription","status":"canceled"}`, subID)
+		default:
+			http.Error(w, `{"error":{"message":"unexpected `+r.Method+` `+r.URL.Path+`"}}`, http.StatusNotFound)
+		}
+	})
+	if err := f.h.takeBackCharge(f.ctx, refundedCharge{ID: "ch_dc_" + f.tag, PaymentIntent: pi, Refunded: true}, "dispute_lost", 0); err != nil {
+		t.Fatalf("lost dispute: %v", err)
+	}
+	if n := cancels.Load(); n != 1 {
+		t.Fatalf("subscription cancelled %d times, want 1", n)
+	}
+	f.assertBackOnFree(t, sessionID, upgradeEndRefund)
+}
+
 // A cancel that fails is retried: the event errors and the licence stays
 // as it was, rather than ending canceled on the paid plan with nothing
 // left to bring it back.
@@ -668,7 +739,7 @@ func TestUpgrade_FreePlanGoneFallbackSurvivesRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The first attempt closes the upgrade, then fails before revoking.
-	if handled, _, err := f.h.refundUpgrade(f.ctx, "ch_g2_"+f.tag, pi, "", nil); err != nil || handled {
+	if handled, _, err := f.h.refundUpgrade(f.ctx, "ch_g2_"+f.tag, pi, "", nil, time.Now().Unix()); err != nil || handled {
 		t.Fatalf("first attempt: handled=%v err=%v", handled, err)
 	}
 	if err := f.h.onChargeRefunded(f.ctx, fmt.Appendf(nil, `{"id":"ch_g2_%s","payment_intent":"%s","refunded":true}`, f.tag, pi)); err != nil {

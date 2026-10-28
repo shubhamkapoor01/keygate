@@ -71,12 +71,15 @@ func TestReplayRenewals(t *testing.T) {
 	if got := ReplayRenewals([]*LicenseRenewal{a, b}); got == nil || !got.Equal(bEnd) {
 		t.Fatalf("full ledger: got %v want %v", got, bEnd)
 	}
-	a.RefundedAt = &now
+	// Refunds after every purchase in the ledger: B was bought while A
+	// was in effect, as its previous end records.
+	later := now.Add(24 * time.Hour)
+	a.RefundedAt = &later
 	// Without A, B started from its own purchase time on a lapsed period.
 	if got := ReplayRenewals([]*LicenseRenewal{a, b}); got == nil || !got.Equal(now.Add(time.Hour).AddDate(0, 0, 100)) {
 		t.Fatalf("A refunded: got %v", got)
 	}
-	b.RefundedAt = &now
+	b.RefundedAt = &later
 	// Everything refunded: back to the original, already lapsed, end.
 	if got := ReplayRenewals([]*LicenseRenewal{a, b}); got == nil || !got.Equal(expired) {
 		t.Fatalf("all refunded: got %v want %v", got, expired)
@@ -100,7 +103,7 @@ func TestReplayRenewals(t *testing.T) {
 	if got := ReplayRenewals([]*LicenseRenewal{life, y}); got == nil || !got.Equal(yEnd) {
 		t.Fatalf("after y: got %v want %v", got, yEnd)
 	}
-	y.RefundedAt = &now
+	y.RefundedAt = &later
 	if got := ReplayRenewals([]*LicenseRenewal{life, y}); got == nil || !got.Equal(cutoff) {
 		t.Fatalf("y refunded: got %v want the hand-set cutoff %v", got, cutoff)
 	}
@@ -118,11 +121,63 @@ func TestReplayRenewals(t *testing.T) {
 	if got := ReplayRenewals([]*LicenseRenewal{a2, z}); got == nil || !got.Equal(zEnd) {
 		t.Fatalf("both live: got %v want %v", got, zEnd)
 	}
-	a2.RefundedAt = &now
+	a2.RefundedAt = &later
 	// expired + the admin's shift (edited - aEnd) + z's 100 days.
 	want := expired.Add(edited.Sub(aEnd)).AddDate(0, 0, 100)
 	if got := ReplayRenewals([]*LicenseRenewal{a2, z}); got == nil || !got.Equal(want) {
 		t.Fatalf("refunding the earlier renewal must remove its days only: got %v want %v", got, want)
+	}
+}
+
+// A renewal refunded before the next was bought had already been taken
+// back out: the next one's previous end records the reverted date, and
+// that is no admin edit. Refunding the next one too goes back to the
+// start, not a year before it.
+func TestReplayRenewalsAfterAnEarlierRefund(t *testing.T) {
+	start := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+	until := start.AddDate(0, 0, 30) // the period still runs
+	ts := func(h int) *time.Time { t := start.Add(time.Duration(h) * time.Hour); return &t }
+	renewal := func(id string, prev *time.Time, created *time.Time) *LicenseRenewal {
+		end := RenewedUpdatesUntil(prev, *created, 365)
+		return &LicenseRenewal{ID: id, PreviousUpdatesUntil: prev, Days: 365, CreatedAt: *created, UpdatesUntil: &end}
+	}
+
+	// a bought, refunded; b bought on the reverted end, refunded.
+	a := renewal("a", &until, ts(0))
+	a.RefundedAt = ts(1)
+	b := renewal("b", &until, ts(2))
+	if got := ReplayRenewals([]*LicenseRenewal{a, b}); got == nil || !got.Equal(*b.UpdatesUntil) {
+		t.Fatalf("a refunded, b live: got %v want %v", got, b.UpdatesUntil)
+	}
+	b.RefundedAt = ts(3)
+	if got := ReplayRenewals([]*LicenseRenewal{a, b}); got == nil || !got.Equal(until) {
+		t.Fatalf("both refunded in turn: got %v want the start %v", got, until)
+	}
+
+	// a and b bought; a refunded after b (b's days stay); then c bought
+	// on that end and refunded: back to b alone.
+	a = renewal("a", &until, ts(0))
+	b = renewal("b", a.UpdatesUntil, ts(1))
+	a.RefundedAt = ts(2)
+	bAlone := RenewedUpdatesUntil(&until, *ts(1), 365)
+	if got := ReplayRenewals([]*LicenseRenewal{a, b}); got == nil || !got.Equal(bAlone) {
+		t.Fatalf("a refunded after b: got %v want %v", got, bAlone)
+	}
+	c := renewal("c", &bAlone, ts(3))
+	c.RefundedAt = ts(4)
+	if got := ReplayRenewals([]*LicenseRenewal{a, b, c}); got == nil || !got.Equal(bAlone) {
+		t.Fatalf("c refunded too: got %v want %v", got, bAlone)
+	}
+
+	// a bought and refunded, then an admin moves the end; b bought on
+	// the edited end and refunded: the edit stays.
+	a = renewal("a", &until, ts(0))
+	a.RefundedAt = ts(1)
+	edited := until.AddDate(0, 0, 50)
+	b = renewal("b", &edited, ts(2))
+	b.RefundedAt = ts(3)
+	if got := ReplayRenewals([]*LicenseRenewal{a, b}); got == nil || !got.Equal(edited) {
+		t.Fatalf("an admin edit after a refund: got %v want the edit %v", got, edited)
 	}
 }
 
