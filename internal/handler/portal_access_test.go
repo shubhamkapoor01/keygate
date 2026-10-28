@@ -114,9 +114,30 @@ func TestPortalLicenseView(t *testing.T) {
 	ctx, s, lic := p.f.ctx, p.f.s, p.f.licA
 
 	l := p.listed(t, lic.Email)
+	l.Notes, l.ExternalCustomerID, l.StripeCustomerID, l.SignupSource = "chargeback risk", "crm_1", "cus_1", "trial_form"
+	l.UserID, l.StripePaymentIntentID, l.StripeCheckoutSessionID, l.ExternalWorkspaceID, l.SignupPlanID = "u1", "pi_1", "cs_1", "ws_1", "plan_1"
+	l.StripeSubscriptionID, l.PaymentProvider = "sub_1", "stripe"
 	key, ok, err := PortalLicenseView(ctx, s, l, strings.ToUpper(lic.Email))
 	if err != nil || !ok || key != lic.LicenseKey {
 		t.Fatalf("owner view = %q, %v, %v; want the licence key", key, ok, err)
+	}
+	// An admin's notes and the operator's references are not the
+	// buyer's to read; what the portal uses for billing stays.
+	if l.UserID != "" || l.StripePaymentIntentID != "" || l.StripeCheckoutSessionID != "" || l.ExternalWorkspaceID != "" || l.SignupPlanID != "" {
+		t.Fatalf("owner view shows operator references: user %q, pi %q, session %q, workspace %q, signup plan %q",
+			l.UserID, l.StripePaymentIntentID, l.StripeCheckoutSessionID, l.ExternalWorkspaceID, l.SignupPlanID)
+	}
+	if l.Notes != "" || l.ExternalCustomerID != "" || l.StripeCustomerID != "" || l.SignupSource != "" {
+		t.Fatalf("owner view shows operator fields: notes %q, external %q, customer %q, signup %q",
+			l.Notes, l.ExternalCustomerID, l.StripeCustomerID, l.SignupSource)
+	}
+	for _, seat := range l.Seats {
+		if seat.UserID != "" {
+			t.Fatalf("owner view shows member %s's account %q", seat.Email, seat.UserID)
+		}
+	}
+	if l.StripeSubscriptionID != "sub_1" || l.PaymentProvider != "stripe" {
+		t.Fatalf("owner view lost the billing the portal uses: %q, %q", l.StripeSubscriptionID, l.PaymentProvider)
 	}
 	if got := devicesOf(l); len(got) != 2 || got["owner-pc"] != "" || got["alice-pc"] != p.alice.Email {
 		t.Fatalf("owner sees %v", got)

@@ -992,8 +992,9 @@ func (s *Store) UpdateLicenseFromSubscription(ctx context.Context, lic *model.Li
 
 // ErrLicenseRestricted reports that a Stripe-driven write was refused
 // because the licence's own state forbids it: revoked, suspended by an
-// operator, or canceled with nothing but an event payload (no current
-// read of Stripe) saying otherwise. Nothing was written — no status, no
+// operator, canceled with nothing but an event payload (no current read
+// of Stripe) saying otherwise, or a pause meeting a licence an operator
+// suspended or that ended. Nothing was written — no status, no
 // dates — and the caller must not announce the change.
 var ErrLicenseRestricted = errors.New("license state does not allow this subscription change")
 
@@ -1041,7 +1042,9 @@ func (s *Store) UpdateLicenseFromSubscriptionReadTerms(ctx context.Context, lic 
 			Held bool `bun:"held"`
 		}
 		if err := tx.NewRaw(`SELECT plan_id, quantity, COALESCE(terms_held_until > clock_timestamp(), false) AS held
-			FROM licenses WHERE id = ? FOR UPDATE`, lic.ID).Scan(ctx, &row); err != nil {
+			FROM licenses WHERE id = ? FOR UPDATE`, lic.ID).Scan(ctx, &row); errors.Is(err, sql.ErrNoRows) {
+			return ErrSubscriptionUnlinked // a licence that is gone is unlinked too
+		} else if err != nil {
 			return err
 		}
 		before = row.LicenseTerms
@@ -1184,8 +1187,43 @@ func (s *Store) updateLicenseAndSubscription(ctx context.Context, lic *model.Lic
 }
 
 func updateLicenseAndSubscriptionIn(ctx context.Context, tx bun.Tx, lic *model.License, stillLinked bool, asOf *time.Time, cols ...string) error {
+	// The row as this write finds it, under the lock the write keeps
+	// until commit: whether it ends a Stripe pause is told once, however
+	// many events race to apply the same resume.
+	var prior struct {
+		Status      string     `bun:"status"`
+		By          string     `bun:"by"`
+		PastDueAt   *time.Time `bun:"past_due_at"`
+		SuspendedAt *time.Time `bun:"suspended_at"`
+	}
+	if err := tx.NewRaw(`SELECT status, COALESCE(suspended_by, '') AS by, past_due_at, suspended_at FROM licenses WHERE id = ? FOR UPDATE`, lic.ID).
+		Scan(ctx, &prior); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	lic.WasStripePaused = prior.Status == model.StatusSuspended && prior.By == model.SuspendedByStripe
+	lic.WasCanceled = prior.Status == model.StatusCanceled
+	lic.WasExpired = prior.Status == model.StatusExpired
+	lic.WasRevoked = prior.Status == model.StatusRevoked
+	lic.WasPastDue, lic.PriorPastDueAt = prior.Status == model.StatusPastDue, prior.PastDueAt
+	// A licence already past due keeps the moment its episode began: two
+	// events entering it at once would each stamp their own, and the
+	// later one would restart the dunning ladder and the episode's notice.
+	if lic.Status == model.StatusPastDue && prior.Status == model.StatusPastDue && prior.PastDueAt != nil && slices.Contains(cols, "past_due_at") {
+		lic.PastDueAt = prior.PastDueAt
+	}
+	// Likewise a pause Stripe already made keeps its start when a later
+	// read shows it again.
+	if lic.Status == model.StatusSuspended && lic.WasStripePaused && prior.SuspendedAt != nil && slices.Contains(cols, "suspended_at") {
+		lic.SuspendedAt = prior.SuspendedAt
+	}
 	lic.UpdatedAt = time.Now()
 	allCols := append(append([]string{}, cols...), "updated_at")
+	// A subscription that ends ends a pause Stripe made with it; an
+	// operator's suspension stays on record.
+	if lic.Status == model.StatusCanceled && lic.WasStripePaused && !slices.Contains(cols, "suspended_by") {
+		lic.SuspendedAt, lic.SuspendedBy = nil, ""
+		allCols = append(allCols, "suspended_at", "suspended_by")
+	}
 	if asOf != nil {
 		lic.StripeSyncedAt = asOf
 		allCols = append(allCols, "stripe_synced_at")
@@ -1209,6 +1247,10 @@ func updateLicenseAndSubscriptionIn(ctx context.Context, tx bun.Tx, lic *model.L
 		case model.StatusActive, model.StatusTrialing, model.StatusPastDue:
 			q = q.Where("NOT (status = ? AND COALESCE(suspended_by, ?) <> ?)",
 				model.StatusSuspended, model.SuspendedByAdmin, model.SuspendedByStripe)
+			// Nor an operator's suspension that non-payment then ended:
+			// canceled, the suspension still on record.
+			q = q.Where("NOT (status = ? AND COALESCE(suspended_by, '') = ?)",
+				model.StatusCanceled, model.SuspendedByAdmin)
 			// Stripe never brings a canceled subscription back, so only a
 			// current read saying it is live (a canceled licence that was
 			// "unpaid", now paid) may revive one — an event payload is
@@ -1216,10 +1258,22 @@ func updateLicenseAndSubscriptionIn(ctx context.Context, tx bun.Tx, lic *model.L
 			if asOf == nil {
 				q = q.Where("status <> ?", model.StatusCanceled)
 			}
+			// Still unpaid is no reason to bring back a licence that
+			// expired for want of payment (past due first, as the sweep
+			// leaves it): only payment does. One that expired at the end
+			// of its grace may still go into dunning.
+			if lic.Status == model.StatusPastDue {
+				q = q.Where("NOT (status = ? AND past_due_at IS NOT NULL)", model.StatusExpired)
+			}
 		case model.StatusSuspended:
-			// A pause must not replace a suspension already in place: it
-			// would turn an operator's into one a resume lifts.
-			q = q.Where("status <> ?", model.StatusSuspended)
+			// A pause must not replace an operator's suspension: it would
+			// turn it into one a resume lifts. Nor does it reach a licence
+			// whose subscription ended. A pause Stripe already made is
+			// written again: it changes nothing, but records this read, so
+			// an older one (a resume read before the pause) is refused.
+			q = q.Where("status <> ?", model.StatusCanceled).
+				Where("NOT (status = ? AND COALESCE(suspended_by, ?) <> ?)",
+					model.StatusSuspended, model.SuspendedByAdmin, model.SuspendedByStripe)
 		}
 	}
 	res, err := q.Exec(ctx)
@@ -1247,8 +1301,13 @@ func updateLicenseAndSubscriptionIn(ctx context.Context, tx bun.Tx, lic *model.L
 		return ErrLicenseRestricted
 	}
 
-	if err := syncSubscriptionStatus(ctx, tx, lic.ID, lic.Status); err != nil {
-		return err
+	// The subscription row follows the status this write set. A write
+	// that left the status alone (an invoice moving only the date) syncs
+	// nothing: its copy may predate a status written since.
+	if slices.Contains(cols, "status") {
+		if err := syncSubscriptionStatus(ctx, tx, lic.ID, lic.Status); err != nil {
+			return err
+		}
 	}
 	// The subscription row names the plan too; a plan the licence moved
 	// to in Stripe moves it with the licence, or the two disagree.
@@ -1570,10 +1629,14 @@ func (s *Store) Audit(ctx context.Context, log *model.AuditLog) {
 	if log.ID == "" {
 		log.ID = newID()
 	}
+	entry := *log
 	go func() {
 		auditCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if _, err := s.DB.NewInsert().Model(log).Exec(auditCtx); err != nil {
+		if entry.ProductID == "" {
+			entry.ProductID = s.ProductOfAudited(auditCtx, entry.Entity, entry.EntityID)
+		}
+		if _, err := s.DB.NewInsert().Model(&entry).Exec(auditCtx); err != nil {
 			slog.Error("audit log write failed", "entity", log.Entity, "entity_id", log.EntityID, "action", log.Action, "error", err)
 		}
 	}()
@@ -1892,6 +1955,21 @@ func (s *Store) HasNotification(ctx context.Context, licenseID, tag string) bool
 	return exists
 }
 
+// TryRecordNotification records tag for a licence and reports whether
+// this call recorded it: of several concurrent callers exactly one goes
+// on to send.
+func (s *Store) TryRecordNotification(ctx context.Context, licenseID, tag string) (bool, error) {
+	res, err := s.DB.NewRaw(
+		"INSERT INTO notifications (id, license_id, tag) VALUES (?, ?, ?) ON CONFLICT (license_id, tag) DO NOTHING",
+		newID(), licenseID, tag,
+	).Exec(ctx)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
 // RecordNotification records that a notification was sent for a license.
 func (s *Store) RecordNotification(ctx context.Context, licenseID, tag string) {
 	_, _ = s.DB.NewRaw(
@@ -1905,9 +1983,9 @@ func (s *Store) RecordNotification(ctx context.Context, licenseID, tag string) {
 // pastDueAt (to the second), and reports whether this call recorded it:
 // of several concurrent callers exactly one goes on to send, and none
 // does once the licence has recovered, been unlinked or begun another
-// episode. A database error reports false — better a missed notice
-// than a duplicate or a stale one.
-func (s *Store) TryRecordPastDueNotification(ctx context.Context, licenseID, subscriptionID string, pastDueAt time.Time, tag string) bool {
+// episode. A database error is returned, for the caller to retry: a
+// guess either way would send a duplicate or miss the notice.
+func (s *Store) TryRecordPastDueNotification(ctx context.Context, licenseID, subscriptionID string, pastDueAt time.Time, tag string) (bool, error) {
 	res, err := s.DB.NewRaw(`INSERT INTO notifications (id, license_id, tag)
 		SELECT ?, l.id, ? FROM licenses l
 		WHERE l.id = ? AND l.stripe_subscription_id = ? AND l.status = 'past_due'
@@ -1915,10 +1993,10 @@ func (s *Store) TryRecordPastDueNotification(ctx context.Context, licenseID, sub
 		ON CONFLICT (license_id, tag) DO NOTHING`,
 		newID(), tag, licenseID, subscriptionID, pastDueAt.Unix()).Exec(ctx)
 	if err != nil {
-		return false
+		return false, err
 	}
-	n, _ := res.RowsAffected()
-	return n == 1
+	n, err := res.RowsAffected()
+	return n == 1, err
 }
 
 // notificationLease is how long a reminder claim may stay unsent
@@ -2992,12 +3070,13 @@ func (s *Store) ClearStripeSubscription(ctx context.Context, licenseID, expected
 }
 
 // UpdateLicenseEmailByStripeCustomer updates email on all licenses for a Stripe customer.
-func (s *Store) UpdateLicenseEmailByStripeCustomer(ctx context.Context, customerID, email string) {
-	_, _ = s.DB.NewUpdate().Model((*model.License)(nil)).
+func (s *Store) UpdateLicenseEmailByStripeCustomer(ctx context.Context, customerID, email string) error {
+	_, err := s.DB.NewUpdate().Model((*model.License)(nil)).
 		Set("email = ?", email).
 		Set("updated_at = now()").
 		Where("stripe_customer_id = ?", customerID).
 		Exec(ctx)
+	return err
 }
 
 // FindAllLicensesByStripeCustomer returns all licenses for a Stripe customer.
@@ -3452,6 +3531,12 @@ func RevertLicenseRenewalIn(ctx context.Context, tx bun.IDB, r *model.LicenseRen
 	if r.RefundedAt != nil {
 		return nil
 	}
+	// On the ledger's clock, as created_at is: the replay compares a
+	// refund with the purchases after it.
+	now, err := ledgerStamp(ctx, tx)
+	if err != nil {
+		return err
+	}
 	// Only the current period's ledger: renewals from before a reset
 	// are recorded as refunded but move nothing.
 	var ledger []*model.LicenseRenewal
@@ -3459,7 +3544,6 @@ func RevertLicenseRenewalIn(ctx context.Context, tx bun.IDB, r *model.LicenseRen
 		OrderExpr("created_at ASC, id ASC").Scan(ctx); err != nil {
 		return err
 	}
-	now := time.Now()
 	if lic.UpdatesUntil != nil && r.UpdatesUntil != nil && r.SupersededAt == nil {
 		predicted := model.ReplayRenewals(ledger)
 		for _, row := range ledger {

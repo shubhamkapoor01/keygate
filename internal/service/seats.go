@@ -174,7 +174,7 @@ func (s *SeatService) AddSeat(ctx context.Context, in AddSeatInput) (*model.Seat
 	// changes, but incident response wants to see attempts too.
 	s.store.Audit(ctx, &model.AuditLog{
 		Entity: "seat", EntityID: seat.ID, Action: "seat_invited",
-		ActorType: "portal_user", ActorID: in.ActorUserID,
+		ActorType: "portal_user", ActorID: in.ActorUserID, ProductID: lic.ProductID,
 		Changes: map[string]any{
 			"license_id": lic.ID, "email": in.Email, "role": in.Role,
 			"outcome": string(outcome),
@@ -331,7 +331,7 @@ func (s *SeatService) removeSeat(ctx context.Context, lic *model.License, seatID
 	}
 	s.store.Audit(ctx, &model.AuditLog{
 		Entity: "seat", EntityID: seatID, Action: "seat_removed",
-		ActorType: actorType, ActorID: actorID, IPAddress: ip,
+		ActorType: actorType, ActorID: actorID, IPAddress: ip, ProductID: lic.ProductID,
 		Changes: map[string]any{"license_id": lic.ID, "email": seat.Email, "devices_removed": len(devices)},
 	})
 	s.logger.Info("seat removed", "license_id", lic.ID, "seat_id", seatID, "devices_removed", len(devices), "by", actorType)

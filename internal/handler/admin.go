@@ -1817,6 +1817,7 @@ func (h *AdminHandler) stripePriceTaken(c *gin.Context, priceID, exceptPlanID st
 
 func (h *AdminHandler) DeletePlan(c *gin.Context) {
 	id := c.Param("id")
+	pid := h.Store.ProductOfAudited(c, "plan", id) // gone after the delete
 	if err := h.Store.DeletePlanUnlessFallback(c, id); err != nil {
 		if errors.Is(err, store.ErrPlanHasLicenses) {
 			response.Err(c, http.StatusConflict, "HAS_LICENSES", "cannot delete plan with existing licenses")
@@ -1834,7 +1835,7 @@ func (h *AdminHandler) DeletePlan(c *gin.Context) {
 	}
 	h.Store.Audit(c, &model.AuditLog{
 		Entity: "plan", EntityID: id, Action: "deleted",
-		ActorType: "admin", ActorID: adminID(c),
+		ActorType: "admin", ActorID: adminID(c), ProductID: pid,
 	})
 	response.NoContent(c)
 }
@@ -2041,6 +2042,7 @@ func (h *AdminHandler) UpdateEntitlement(c *gin.Context) {
 }
 
 func (h *AdminHandler) DeleteEntitlement(c *gin.Context) {
+	pid := h.Store.ProductOfAudited(c, "entitlement", c.Param("id")) // gone after the delete
 	if err := h.Store.DeleteEntitlement(c, c.Param("id")); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			response.NotFound(c, "entitlement not found")
@@ -2051,7 +2053,7 @@ func (h *AdminHandler) DeleteEntitlement(c *gin.Context) {
 	}
 	h.Store.Audit(c, &model.AuditLog{
 		Entity: "entitlement", EntityID: c.Param("id"), Action: "deleted",
-		ActorType: "admin", ActorID: adminID(c),
+		ActorType: "admin", ActorID: adminID(c), ProductID: pid,
 	})
 	response.NoContent(c)
 }
@@ -2354,6 +2356,7 @@ func (h *AdminHandler) RotateAPIKey(c *gin.Context) {
 
 func (h *AdminHandler) DeleteAPIKey(c *gin.Context) {
 	id := c.Param("id")
+	pid := h.Store.ProductOfAudited(c, "api_key", id) // gone after the delete
 	if err := h.Store.DeleteAPIKey(c, id); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			response.NotFound(c, "api key not found")
@@ -2364,7 +2367,7 @@ func (h *AdminHandler) DeleteAPIKey(c *gin.Context) {
 	}
 	h.Store.Audit(c, &model.AuditLog{
 		Entity: "api_key", EntityID: id, Action: "deleted",
-		ActorType: "admin", ActorID: adminID(c),
+		ActorType: "admin", ActorID: adminID(c), ProductID: pid,
 	})
 	response.NoContent(c)
 }
@@ -3402,7 +3405,7 @@ func (h *AdminHandler) DeleteActivation(c *gin.Context) {
 	}
 	h.Store.Audit(c, &model.AuditLog{
 		Entity: "activation", EntityID: id, Action: "deleted",
-		ActorType: "admin", ActorID: adminID(c),
+		ActorType: "admin", ActorID: adminID(c), ProductID: pid,
 		Changes: map[string]any{"license_id": act.LicenseID, "identifier": act.Identifier},
 	})
 	if h.Webhook != nil {
@@ -3949,6 +3952,7 @@ func (h *AdminHandler) UpdateAddon(c *gin.Context) {
 }
 
 func (h *AdminHandler) DeleteAddon(c *gin.Context) {
+	pid := h.Store.ProductOfAudited(c, "addon", c.Param("id")) // gone after the delete
 	if err := h.Store.DeleteAddon(c, c.Param("id")); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			response.NotFound(c, "addon not found")
@@ -3959,7 +3963,7 @@ func (h *AdminHandler) DeleteAddon(c *gin.Context) {
 	}
 	h.Store.Audit(c, &model.AuditLog{
 		Entity: "addon", EntityID: c.Param("id"), Action: "deleted",
-		ActorType: "admin", ActorID: adminID(c),
+		ActorType: "admin", ActorID: adminID(c), ProductID: pid,
 	})
 	response.NoContent(c)
 }
@@ -4965,16 +4969,11 @@ func (h *AdminHandler) InviteTeamMember(c *gin.Context) {
 		if siteName == "" {
 			siteName = "Keygate"
 		}
-		baseURL, _ := h.Store.GetSetting(c, "base_url")
-		if baseURL == "" {
-			baseURL = adminBaseURL(c)
-		}
-		loginURL := strings.TrimRight(baseURL, "/") + "/login"
 		inviter := actorUser.Name
 		if inviter == "" {
 			inviter = actorUser.Email
 		}
-		h.Email.SendAdminInvite(req.Email, siteName, inviter, role, loginURL)
+		h.Email.SendAdminInvite(req.Email, siteName, inviter, role)
 	}
 
 	response.OK(c, user)
@@ -4992,21 +4991,6 @@ func teamRoleError(c *gin.Context, err error) {
 	default:
 		response.Internal(c, err)
 	}
-}
-
-// adminBaseURL infers the public base URL from the inbound request
-// when the settings table doesn't have an explicit BASE_URL. Used
-// only as a fallback for the admin invite email's login link.
-func adminBaseURL(c *gin.Context) string {
-	scheme := "http"
-	if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" {
-		scheme = "https"
-	}
-	host := c.Request.Host
-	if forwarded := c.GetHeader("X-Forwarded-Host"); forwarded != "" {
-		host = forwarded
-	}
-	return scheme + "://" + host
 }
 
 // RemoveTeamMember demotes an admin back to regular user.

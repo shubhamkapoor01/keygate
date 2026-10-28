@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { useSiteConfig } from "@/hooks/use-site-config"
 import { useI18n } from "@/i18n"
-import { checkout } from "@/lib/api"
+import { checkout, errorCode } from "@/lib/api"
 
 export default function CheckoutSuccessPage() {
   const { t } = useI18n()
@@ -30,7 +30,11 @@ export default function CheckoutSuccessPage() {
         if (r.email) setEmail(r.email)
         setKind(r.kind ?? "")
       })
-      .catch(() => setStatus("error"))
+      .catch((e) => {
+        // Paid, and the delivery that failed is retried (FULFILLMENT_RETRY):
+        // the same "processing" answer as a pending one, not a failure.
+        setStatus(errorCode(e) === "FULFILLMENT_RETRY" ? "pending" : "error")
+      })
   }, [])
 
   return (

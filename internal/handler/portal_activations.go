@@ -227,7 +227,7 @@ func (h *PortalActivationsHandler) Delete(c *gin.Context) {
 
 	h.store.Audit(c.Request.Context(), &model.AuditLog{
 		Entity: "activation", EntityID: activationID, Action: "deleted",
-		ActorType: "portal", ActorID: emailFromContext(c), IPAddress: c.ClientIP(),
+		ActorType: "portal", ActorID: emailFromContext(c), IPAddress: c.ClientIP(), ProductID: lic.ProductID,
 		Changes: map[string]any{"license_id": lic.ID, "via": "self_service"},
 	})
 	if h.webhook != nil {

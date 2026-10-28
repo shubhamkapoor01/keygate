@@ -232,6 +232,7 @@ func (h *ReleaseAdminHandler) DeleteArtifact(c *gin.Context) {
 	h.store.Audit(c.Request.Context(), &model.AuditLog{
 		Entity: "release_artifact", EntityID: aid, Action: "deleted",
 		ActorType: "admin", ActorID: adminID(c), IPAddress: c.ClientIP(),
+		ProductID: h.store.ProductOfAudited(c.Request.Context(), "release", id),
 	})
 	response.OK(c, gin.H{"status": "deleted"})
 }
@@ -430,13 +431,14 @@ func (h *ReleaseAdminHandler) Delete(c *gin.Context) {
 	if !h.checkReleaseScope(c, id) {
 		return
 	}
+	pid := h.store.ProductOfAudited(c.Request.Context(), "release", id) // gone after the delete
 	if err := h.svc.DeleteDraft(c.Request.Context(), id); err != nil {
 		writeAppErr(c, err)
 		return
 	}
 	h.store.Audit(c.Request.Context(), &model.AuditLog{
 		Entity: "release", EntityID: id, Action: "deleted",
-		ActorType: "admin", ActorID: adminID(c), IPAddress: c.ClientIP(),
+		ActorType: "admin", ActorID: adminID(c), IPAddress: c.ClientIP(), ProductID: pid,
 	})
 	response.OK(c, gin.H{"status": "deleted"})
 }

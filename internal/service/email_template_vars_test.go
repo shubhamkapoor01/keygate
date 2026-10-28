@@ -134,3 +134,13 @@ func TestRenderEmail_FallsBackToDefault(t *testing.T) {
 		t.Fatalf("broken custom template not replaced by the default:\n%s", body)
 	}
 }
+
+// The admin invite links to BASE_URL's login page, not to whatever host
+// the inviting request came through.
+func TestRenderAdminInvite_LoginURL(t *testing.T) {
+	s := newTemplateTestService()
+	subject, body := s.RenderAdminInvite("Acme", "Owner", "admin")
+	if subject != "You've been added to Acme" || !strings.Contains(body, `https://licenses.example.com/login`) {
+		t.Fatalf("subject %q, body:\n%s", subject, body)
+	}
+}

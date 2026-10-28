@@ -194,17 +194,11 @@ func (h *StripeHandler) seatsMatter(ctx context.Context, planIDs ...string) bool
 // change Stripe held until paid, now paid, replaced or dropped, or still
 // waiting. Its failure is no reason to dun the customer. A change that
 // did put the subscription behind (one made in Stripe without holding
-// it) shows as past_due there, and is dunned as usual. An error means
-// Stripe could not be asked; the event is retried.
-func (h *StripeHandler) heldChangeInvoice(inv *invoiceEvent) (bool, error) {
-	if inv.BillingReason != "subscription_update" {
-		return false, nil
-	}
-	cur, err := h.currentSubscription(inv.SubscriptionID())
-	if err != nil {
-		return false, err
-	}
-	return cur != nil && (cur.Status == "active" || cur.Status == "trialing"), nil
+// it) shows as past_due there, and is dunned as usual. cur is the
+// subscription as Stripe has it now (nil when it cannot be read).
+func heldChangeInvoice(inv *invoiceEvent, cur *subscriptionEvent) bool {
+	return inv.BillingReason == "subscription_update" &&
+		cur != nil && (cur.Status == "active" || cur.Status == "trialing")
 }
 
 // changeOnly reports whether an invoice bills only the difference a

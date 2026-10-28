@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -87,6 +88,13 @@ func (h *WebhookAdminHandler) CreateWebhook(c *gin.Context) {
 		response.Internal(c, err)
 		return
 	}
+	// Where licence events are sent is worth a record; the secret is not
+	// written down, nor the URL's path and query, which may carry a token.
+	h.Store.Audit(c, &model.AuditLog{
+		Entity: "webhook", EntityID: w.ID, Action: "created",
+		ActorType: "admin", ActorID: adminID(c), IPAddress: c.ClientIP(), ProductID: w.ProductID,
+		Changes: map[string]any{"target": webhookTarget(w.URL), "events": w.Events},
+	})
 
 	response.Created(c, gin.H{
 		"id":         w.ID,
@@ -138,18 +146,39 @@ func (h *WebhookAdminHandler) UpdateWebhook(c *gin.Context) {
 		response.Internal(c, err)
 		return
 	}
+	h.Store.Audit(c, &model.AuditLog{
+		Entity: "webhook", EntityID: w.ID, Action: "updated",
+		ActorType: "admin", ActorID: adminID(c), IPAddress: c.ClientIP(), ProductID: w.ProductID,
+		Changes: map[string]any{"target": webhookTarget(w.URL), "events": w.Events, "active": w.Active},
+	})
 	response.OK(c, w)
 }
 
 func (h *WebhookAdminHandler) DeleteWebhook(c *gin.Context) {
-	if _, ok := h.checkWebhookScope(c, c.Param("id")); !ok {
+	w, ok := h.checkWebhookScope(c, c.Param("id"))
+	if !ok {
 		return
 	}
 	if err := h.Store.DeleteWebhook(c, c.Param("id")); err != nil {
 		response.Internal(c, err)
 		return
 	}
+	h.Store.Audit(c, &model.AuditLog{
+		Entity: "webhook", EntityID: w.ID, Action: "deleted",
+		ActorType: "admin", ActorID: adminID(c), IPAddress: c.ClientIP(), ProductID: w.ProductID,
+		Changes: map[string]any{"target": webhookTarget(w.URL)},
+	})
 	response.NoContent(c)
+}
+
+// webhookTarget is a webhook URL as an audit line keeps it: scheme and
+// host only.
+func webhookTarget(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
 }
 
 // checkWebhookScope blocks a product-scoped api_key from reaching

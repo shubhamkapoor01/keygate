@@ -1,6 +1,8 @@
 package payment
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gin-gonic/gin"
 
 	"github.com/tabloy/keygate/internal/model"
 	"github.com/tabloy/keygate/internal/service"
@@ -39,6 +43,93 @@ func TestCancelForAdmin_RevertsAnUpgrade(t *testing.T) {
 		t.Fatalf("subscription cancelled %d times, want 1", canceled)
 	}
 	f.assertBackOnFree(t, sessionID, upgradeEndAdmin)
+}
+
+// The customer's immediate cancel in the portal puts an upgraded licence
+// back on its free plan too, and says nothing of an end: the licence goes
+// on, free. The deletion Stripe sends next finds nothing to do.
+func TestPortalImmediateCancel_RevertsAnUpgrade(t *testing.T) {
+	f := newUpgradeFixture(t, "portalcancel")
+	sessionID, subID := "cs_pc_"+f.tag, "sub_pc_"+f.tag
+	f.applySub(t, sessionID, subID)
+	stubStripe(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && r.URL.Path == "/v1/subscriptions/"+subID {
+			fmt.Fprintf(w, `{"id":"%s","object":"subscription","status":"canceled"}`, subID)
+			return
+		}
+		http.Error(w, "unexpected", http.StatusNotFound)
+	})
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/portal/subscription/cancel",
+		bytes.NewBufferString(fmt.Sprintf(`{"license_id":%q,"immediate":true}`, f.lic.ID)))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("email", f.lic.Email)
+	f.h.CancelSubscription(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("cancel = %d: %s", w.Code, w.Body.String())
+	}
+	if err := f.h.onSubscriptionDeleted(f.ctx, []byte(fmt.Sprintf(`{"id":%q}`, subID))); err != nil {
+		t.Fatal(err)
+	}
+	f.assertBackOnFree(t, sessionID, upgradeEndCanceled)
+	time.Sleep(500 * time.Millisecond) // audit lines land in the background
+	var n int
+	if err := f.s.DB.NewRaw("SELECT count(*) FROM audit_logs WHERE entity_id = ? AND action = 'canceled'", f.lic.ID).Scan(f.ctx, &n); err != nil || n != 0 {
+		t.Fatalf("%d canceled lines (%v) for a licence that went back to free, want none", n, err)
+	}
+}
+
+// Detached work ends before its claim could be taken over.
+func TestWebhookWorkEndsBeforeItsClaimGoesStale(t *testing.T) {
+	if webhookWorkTimeout >= staleClaimAge {
+		t.Fatalf("webhookWorkTimeout %v must be shorter than staleClaimAge %v", webhookWorkTimeout, staleClaimAge)
+	}
+}
+
+// The customer's immediate cancel of a plain subscription ends the
+// licence and tells it once; the deletion Stripe sends next stays quiet.
+func TestPortalImmediateCancel_ToldOnce(t *testing.T) {
+	f := newUpgradeFixture(t, "portalplain")
+	subID := "sub_pp_" + f.tag
+	l := f.reload(t)
+	since := time.Now().Add(-48 * time.Hour)
+	l.StripeSubscriptionID, l.PaymentProvider, l.Status, l.PastDueAt = subID, "stripe", model.StatusPastDue, &since
+	if err := f.s.UpdateLicense(f.ctx, l, "stripe_subscription_id", "payment_provider", "status", "past_due_at"); err != nil {
+		t.Fatal(err)
+	}
+	stubStripe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"id":"%s","object":"subscription","status":"canceled"}`, subID)
+	})
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/portal/subscription/cancel",
+		bytes.NewBufferString(fmt.Sprintf(`{"license_id":%q,"immediate":true}`, f.lic.ID)))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set("email", f.lic.Email)
+	// The customer closes the page as soon as Stripe has the cancel: the
+	// write and the notice still finish.
+	closed, closePage := context.WithCancel(context.Background())
+	closePage()
+	c.Request = c.Request.WithContext(closed)
+	f.h.CancelSubscription(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("cancel = %d: %s", w.Code, w.Body.String())
+	}
+	if got := f.reload(t); got.Status != model.StatusCanceled || got.PastDueAt != nil {
+		t.Fatalf("after the cancel: %s, past due since %v; want canceled, past due no more", got.Status, got.PastDueAt)
+	}
+	if err := f.h.onSubscriptionDeleted(f.ctx, []byte(fmt.Sprintf(`{"id":%q}`, subID))); err != nil {
+		t.Fatal(err)
+	}
+	if st := f.reload(t).Status; st != model.StatusCanceled {
+		t.Fatalf("status %s, want canceled", st)
+	}
+	time.Sleep(500 * time.Millisecond) // audit lines land in the background
+	var n int
+	if err := f.s.DB.NewRaw("SELECT count(*) FROM audit_logs WHERE entity_id = ? AND action = 'canceled'", f.lic.ID).Scan(f.ctx, &n); err != nil || n != 1 {
+		t.Fatalf("the end told %d times (%v), want once", n, err)
+	}
 }
 
 // For a licence no upgrade moved, the subscription is cancelled and the

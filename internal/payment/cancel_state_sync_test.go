@@ -462,9 +462,9 @@ func TestSubscriptionDeletedOutranksOlderReads(t *testing.T) {
 }
 
 // A subscription.updated that read Stripe after the deletion may write
-// "canceled" first; the deletion must still apply and send what only it
-// sends — the audit line and the license.canceled webhook — and must not
-// move the read stamp back.
+// "canceled" first, and tells the end itself; the deletion must still
+// apply, must not tell it a second time, and must not move the read
+// stamp back.
 func TestSubscriptionDeletedAppliesAfterANewerRead(t *testing.T) {
 	s, ctx := openStore(t)
 	defer s.Close()
@@ -486,14 +486,14 @@ func TestSubscriptionDeletedAppliesAfterANewerRead(t *testing.T) {
 	// The newer read already applied "canceled", stamped after the moment
 	// the deletion handler will take.
 	newer := time.Now().Add(time.Hour).Truncate(time.Microsecond)
+	h := &StripeHandler{Store: s}
 	canceled := *lic
-	canceled.Status = model.StatusCanceled
-	if err := s.UpdateLicenseFromSubscriptionRead(ctx, &canceled, newer, "status"); err != nil {
+	if err := h.applySubscriptionState(ctx, &canceled, &subscriptionEvent{ID: lic.StripeSubscriptionID, Status: "canceled"}, &newer, "customer.subscription.updated"); err != nil {
 		t.Fatal(err)
 	}
-
-	h := &StripeHandler{Store: s}
-	h.onSubscriptionDeleted(ctx, []byte(fmt.Sprintf(`{"id":%q}`, lic.StripeSubscriptionID)))
+	if err := h.onSubscriptionDeleted(ctx, []byte(fmt.Sprintf(`{"id":%q}`, lic.StripeSubscriptionID))); err != nil {
+		t.Fatal(err)
+	}
 
 	// Audit lines are written in the background.
 	var audits int
@@ -505,8 +505,12 @@ func TestSubscriptionDeletedAppliesAfterANewerRead(t *testing.T) {
 			time.Sleep(100 * time.Millisecond)
 		}
 	}
+	time.Sleep(300 * time.Millisecond) // and no second one arrives
+	if err := s.DB.NewRaw("SELECT count(*) FROM audit_logs WHERE entity_id = ? AND action = 'canceled'", lic.ID).Scan(ctx, &audits); err != nil {
+		t.Fatal(err)
+	}
 	if audits != 1 {
-		t.Fatalf("deletion after a newer read: %d canceled audit lines, want 1 (its notifications were skipped)", audits)
+		t.Fatalf("deletion after a newer read: the end told %d times, want once", audits)
 	}
 	var status string
 	var stamp time.Time

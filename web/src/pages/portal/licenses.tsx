@@ -588,7 +588,10 @@ function EntitlementsSection({ entitlements }: { entitlements: Entitlement[] }) 
               <Badge variant="secondary">{t("common.active")}</Badge>
             ) : ent.value_type === "quota" ? (
               <span>
-                {formatNumber(Number(ent.value))} {ent.quota_unit || "units"} / {ent.quota_period || "period"}
+                {/^\+?\d+$/.test(ent.value) && Number(ent.value) > 0
+                  ? formatNumber(Number(ent.value))
+                  : t("common.unlimited")}{" "}
+                {ent.quota_unit || "units"} / {ent.quota_period || "period"}
               </span>
             ) : (
               <span>{ent.value}</span>
@@ -1061,14 +1064,17 @@ function QuotaUsageSection({ license }: { license: PortalLicense }) {
 }
 
 function QuotaBar({ entitlement, licenseKey }: { entitlement: Entitlement; licenseKey: string }) {
+  const { t } = useI18n()
   const { data, isLoading } = useQuery({
     queryKey: ["portal", "quota", licenseKey, entitlement.feature],
     queryFn: () => portal.quotaStatus({ license_key: licenseKey, feature: entitlement.feature }),
   })
 
-  const limit = Number(entitlement.value) || 0
+  // The limit the server enforces; 0 means no limit, as it does there.
+  const limit = data?.limit ?? (Number(entitlement.value) || 0)
+  const unlimited = limit <= 0
   const used = data?.used ?? 0
-  const percentage = limit > 0 ? Math.min((used / limit) * 100, 100) : 0
+  const percentage = unlimited ? 0 : Math.min((used / limit) * 100, 100)
   const isWarning = percentage >= 80
 
   if (isLoading) {
@@ -1080,10 +1086,12 @@ function QuotaBar({ entitlement, licenseKey }: { entitlement: Entitlement; licen
       <div className="flex items-center justify-between text-sm">
         <span className="font-medium">{entitlement.feature}</span>
         <span className={cn("text-xs", isWarning ? "text-amber-600 font-medium" : "text-muted-foreground")}>
-          {formatNumber(used)} / {formatNumber(limit)} ({Math.round(percentage)}%)
+          {unlimited
+            ? `${formatNumber(used)} / ${t("common.unlimited")}`
+            : `${formatNumber(used)} / ${formatNumber(limit)} (${Math.round(percentage)}%)`}
         </span>
       </div>
-      <div className="h-2.5 bg-muted rounded-full overflow-hidden">
+      <div className={cn("h-2.5 bg-muted rounded-full overflow-hidden", unlimited && "hidden")}>
         <div
           className={cn(
             "h-full rounded-full transition-all",

@@ -242,7 +242,8 @@ func TestInvoicePaidFollowsTheCurrentSubscription(t *testing.T) {
 	}
 
 	resume := func(lic *model.License) {
-		if err := h.onSubscriptionResumed(ctx, []byte(fmt.Sprintf(`{"id":%q}`, lic.StripeSubscriptionID))); err != nil {
+		// customer.subscription.resumed is read and applied like an update.
+		if err := h.onSubscriptionUpdated(ctx, []byte(fmt.Sprintf(`{"id":%q}`, lic.StripeSubscriptionID))); err != nil {
 			t.Fatal(err)
 		}
 	}

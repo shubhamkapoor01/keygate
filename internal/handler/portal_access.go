@@ -30,6 +30,7 @@ import (
 func PortalLicenseView(ctx context.Context, st *store.Store, lic *model.License, email string) (key string, ok bool, err error) {
 	if strings.EqualFold(lic.Email, email) {
 		key = st.DecryptLicenseKey(lic)
+		trimForOwner(lic)
 	} else {
 		viewer := PortalViewerSeat(lic, email)
 		if viewer == nil || lic.Product == nil || !model.ProductSupports(lic.Product.Type, model.CapSeats) {
@@ -67,6 +68,25 @@ func PortalLicenseView(ctx context.Context, st *store.Store, lic *model.License,
 		return "", false, err
 	}
 	return key, true, nil
+}
+
+// trimForOwner leaves out of the owner's copy what is the operator's: the
+// admin's notes, the references an integration or the checkout keeps,
+// and how the licence was signed up for. The portal shows none of it;
+// what it uses (the subscription, the provider, a held change) stays.
+func trimForOwner(lic *model.License) {
+	lic.Notes = ""
+	lic.UserID = ""
+	lic.StripeCustomerID = ""
+	lic.StripePaymentIntentID = ""
+	lic.StripeCheckoutSessionID = ""
+	lic.ExternalCustomerID = ""
+	lic.ExternalWorkspaceID = ""
+	lic.SignupSource = ""
+	lic.SignupPlanID = ""
+	for _, seat := range lic.Seats {
+		seat.UserID = ""
+	}
 }
 
 // trimForMember leaves out of a member's copy of the licence what is the

@@ -146,23 +146,23 @@ func TestTryRecordPastDueNotification(t *testing.T) {
 	}
 	tag := func(at time.Time) string { return "payment_failed:" + at.Format("20060102150405") }
 
-	if !s.TryRecordPastDueNotification(ctx, lic.ID, sub, entered, tag(entered)) {
-		t.Fatal("past_due on its subscription: not recorded")
+	if ok, err := s.TryRecordPastDueNotification(ctx, lic.ID, sub, entered, tag(entered)); !ok || err != nil {
+		t.Fatalf("past_due on its subscription: not recorded (%v)", err)
 	}
-	if s.TryRecordPastDueNotification(ctx, lic.ID, sub, entered, tag(entered)) {
+	if ok, _ := s.TryRecordPastDueNotification(ctx, lic.ID, sub, entered, tag(entered)); ok {
 		t.Fatal("recorded twice")
 	}
 	other := entered.Add(-24 * time.Hour)
-	if s.TryRecordPastDueNotification(ctx, lic.ID, sub, other, tag(other)) {
+	if ok, _ := s.TryRecordPastDueNotification(ctx, lic.ID, sub, other, tag(other)); ok {
 		t.Fatal("recorded for an episode the licence is not in")
 	}
-	if s.TryRecordPastDueNotification(ctx, lic.ID, "sub_other", entered, tag(entered)+":x") {
+	if ok, _ := s.TryRecordPastDueNotification(ctx, lic.ID, "sub_other", entered, tag(entered)+":x"); ok {
 		t.Fatal("recorded for a subscription the licence is not on")
 	}
 	if _, err := s.DB.NewRaw("UPDATE licenses SET status = 'active', past_due_at = NULL WHERE id = ?", lic.ID).Exec(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if s.TryRecordPastDueNotification(ctx, lic.ID, sub, entered, tag(entered)+":y") {
+	if ok, _ := s.TryRecordPastDueNotification(ctx, lic.ID, sub, entered, tag(entered)+":y"); ok {
 		t.Fatal("recorded after the licence recovered")
 	}
 }

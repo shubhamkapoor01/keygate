@@ -98,8 +98,8 @@ func (c *ExpiryChecker) FinishSeatRemovals(ctx context.Context) {
 		}
 		c.store.Audit(ctx, &model.AuditLog{
 			Entity: "seat", EntityID: seat.ID, Action: "seat_removal_finished",
-			ActorType: "system",
-			Changes:   map[string]any{"license_id": seat.LicenseID, "email": seat.Email, "devices_removed": len(devices)},
+			ActorType: "system", ProductID: seat.ProductID,
+			Changes: map[string]any{"license_id": seat.LicenseID, "email": seat.Email, "devices_removed": len(devices)},
 		})
 		c.logger.Info("seat removal finished", "seat_id", seat.ID, "license_id", seat.LicenseID, "devices_removed", len(devices))
 	}

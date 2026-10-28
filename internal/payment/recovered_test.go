@@ -63,8 +63,8 @@ func TestNotifyPaymentRecovered_EpisodeScopedDedup(t *testing.T) {
 	// helper tolerates both being nil (sending is best-effort).
 	h := &StripeHandler{Store: s}
 
-	episode1 := int64(1700000000)
-	episode2 := int64(1710000000)
+	ep1, ep2 := time.Unix(1700000000, 0), time.Unix(1710000000, 0)
+	episode1, episode2 := &ep1, &ep2
 
 	// Episode 1 — first recovery fires.
 	h.notifyPaymentRecovered(ctx, lic, episode1)
@@ -141,12 +141,12 @@ func TestNotifyPaymentRecovered_LegacyZeroEpisode(t *testing.T) {
 	_ = s.CreateLicense(ctx, lic)
 
 	h := &StripeHandler{Store: s}
-	h.notifyPaymentRecovered(ctx, lic, 0)
+	h.notifyPaymentRecovered(ctx, lic, nil)
 	if !s.HasNotification(ctx, lic.ID, "payment_recovered") {
 		t.Fatal("legacy zero-episode path must still record the bare tag once")
 	}
 	// Re-fire with zero — should dedup.
-	h.notifyPaymentRecovered(ctx, lic, 0)
+	h.notifyPaymentRecovered(ctx, lic, nil)
 	var n int
 	if err := s.DB.NewRaw(
 		`SELECT COUNT(*) FROM notifications WHERE license_id = ? AND tag = 'payment_recovered'`,

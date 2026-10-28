@@ -890,6 +890,19 @@ func (s *EmailService) SendDunningFinal(to, productName string) {
 	}()
 }
 
+// RenderAdminInvite builds the admin invite. The login link comes from
+// BASE_URL, like every other link Keygate mails: the request that made
+// the invite says nothing reliable about the public address, and behind
+// a proxy it read as http://127.0.0.1:9000.
+func (s *EmailService) RenderAdminInvite(siteName, inviterName, role string) (subject, body string) {
+	return "You've been added to " + siteName, s.renderEmail("admin_invite", tmplAdminInvite, map[string]string{
+		"SiteName": siteName,
+		"Inviter":  inviterName,
+		"Role":     role,
+		"LoginURL": s.baseURL + "/login",
+	})
+}
+
 // SendAdminInvite notifies a Keygate platform operator that they
 // were added (or promoted) to the admin team. The "invite" is
 // really a role grant — the recipient can log in via email-OTP
@@ -899,15 +912,9 @@ func (s *EmailService) SendDunningFinal(to, productName string) {
 // Best-effort: a delivery failure does NOT roll back the role
 // grant on the InviteTeamMember handler. The recipient can still
 // learn out-of-band that they're admin.
-func (s *EmailService) SendAdminInvite(to, siteName, inviterName, role, loginURL string) {
-	body := s.renderEmail("admin_invite", tmplAdminInvite, map[string]string{
-		"SiteName": siteName,
-		"Inviter":  inviterName,
-		"Role":     role,
-		"LoginURL": loginURL,
-	})
+func (s *EmailService) SendAdminInvite(to, siteName, inviterName, role string) {
+	subj, body := s.RenderAdminInvite(siteName, inviterName, role)
 	go func() {
-		subj := "You've been added to " + siteName
 		if err := s.Send(to, subj, body); err != nil {
 			s.logger.Error("email delivery failed", "to", to, "subject", subj, "error", err)
 		}

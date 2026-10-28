@@ -839,17 +839,47 @@ func (s *Store) ExportLicenses(ctx context.Context, productID, status string) ([
 
 // ─── Audit Log ───
 
+// ProductOfAudited is the product an audited entity belongs to, or ""
+// when it has none, is gone, or cannot be read: an audit line is written
+// regardless. A handler deleting an entity asks before the delete.
+func (s *Store) ProductOfAudited(ctx context.Context, entity, entityID string) string {
+	var q string
+	switch entity {
+	case "product":
+		return entityID
+	case "license", "plan", "addon", "webhook", "release", "api_key", "release_signing_key":
+		q = "SELECT product_id FROM " + map[string]string{
+			"license": "licenses", "plan": "plans", "addon": "addons", "webhook": "webhooks",
+			"release": "releases", "api_key": "api_keys", "release_signing_key": "release_signing_keys",
+		}[entity] + " WHERE id = ?"
+	case "seat":
+		q = "SELECT l.product_id FROM seats x JOIN licenses l ON l.id = x.license_id WHERE x.id = ?"
+	case "activation":
+		q = "SELECT l.product_id FROM activations x JOIN licenses l ON l.id = x.license_id WHERE x.id = ?"
+	case "entitlement":
+		q = "SELECT p.product_id FROM entitlements x JOIN plans p ON p.id = x.plan_id WHERE x.id = ?"
+	case "release_artifact":
+		q = "SELECT r.product_id FROM release_artifacts x JOIN releases r ON r.id = x.release_id WHERE x.id = ?"
+	case "webhook_delivery":
+		q = "SELECT w.product_id FROM webhook_deliveries x JOIN webhooks w ON w.id = x.webhook_id WHERE x.id = ?"
+	default:
+		return ""
+	}
+	var pid sql.NullString
+	if err := s.DB.NewRaw(q, entityID).Scan(ctx, &pid); err != nil {
+		return ""
+	}
+	return pid.String
+}
+
 // ListAuditLogs returns paginated audit-log rows. Filters compose
-// with AND. The optional productID filter resolves the parent product
-// across the entity types that carry a product_id FK (license, plan,
-// addon, webhook, release, api_key, plus the product row itself). It
-// is best-effort: 2-hop entities (seat, activation, release_artifact)
-// aren't matched and silently fall out of the filtered view.
-// auditOfProduct narrows an audit_logs query to one product: the
-// product itself and everything that belongs to it. The audit page and
-// the analytics activity feed both scope through here.
+// with AND.
+// auditOfProduct narrows an audit_logs query to one product: the lines
+// recorded with it, and lines written before the product was recorded
+// that are about the product or something that still belongs to it. The
+// audit page and the analytics activity feed both scope through here.
 func auditOfProduct(q *bun.SelectQuery, productID string) *bun.SelectQuery {
-	return q.Where(`(
+	return q.Where(`(product_id = ? OR (product_id IS NULL AND (
             (entity = 'product' AND entity_id = ?)
          OR entity_id IN (SELECT id FROM licenses  WHERE product_id = ?)
          OR entity_id IN (SELECT id FROM plans     WHERE product_id = ?)
@@ -857,7 +887,7 @@ func auditOfProduct(q *bun.SelectQuery, productID string) *bun.SelectQuery {
          OR entity_id IN (SELECT id FROM webhooks  WHERE product_id = ?)
          OR entity_id IN (SELECT id FROM releases  WHERE product_id = ?)
          OR entity_id IN (SELECT id FROM api_keys  WHERE product_id = ?)
-        )`, productID, productID, productID, productID, productID, productID, productID)
+        )))`, productID, productID, productID, productID, productID, productID, productID, productID)
 }
 
 func (s *Store) ListAuditLogs(ctx context.Context, entity, entityID, productID string, offset, limit int) ([]*model.AuditLog, int, error) {

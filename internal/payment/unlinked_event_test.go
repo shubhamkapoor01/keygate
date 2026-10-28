@@ -118,8 +118,8 @@ func TestEveryCallerChecksTheApplyResult(t *testing.T) {
 	if len(checked) != len(all) {
 		t.Errorf("%d of %d call sites read `if landed, err := h.applyLicenseFromSubscription(...); !landed { return err }`", len(checked), len(all))
 	}
-	if len(all) < 6 {
-		t.Errorf("found %d call sites, expected the six subscription webhooks", len(all))
+	if len(all) < 4 {
+		t.Errorf("found %d call sites, expected four: invoice.paid, the subscription state, the deletion and payment_failed", len(all))
 	}
 }
 
