@@ -203,6 +203,11 @@ func TestPastDueSweep_ExpiresAfter30Days(t *testing.T) {
 			t.Fatalf("past due since %v (updated %v): %s, want %s", lic.PastDueAt, lic.UpdatedAt, got, want)
 		}
 	}
+	// The episode stays on record: it is how a later past_due event is
+	// told from a renewal that failed after a grace expiry, and refused.
+	if f.load(stale).PastDueAt == nil {
+		t.Fatal("the sweep cleared past_due_at")
+	}
 	if sub, err := f.s.FindSubscriptionByLicense(f.ctx, stale.ID); err != nil || sub.Status != model.StatusExpired {
 		t.Fatalf("subscription row %+v (%v); want it expired with the licence", sub, err)
 	}
