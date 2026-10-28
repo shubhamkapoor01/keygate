@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -55,6 +56,10 @@ type VerifyToken struct {
 	GraceDays    int    `json:"grc"`
 	Nonce        string `json:"nce"`           // unique per-issuance to prevent replay
 	Fingerprint  string `json:"fpr,omitempty"` // SHA256(identifier+product_id) for binding
+	// SeatID is the member seat whose key the token was issued to, absent
+	// for the licence's own key: a refresh must come from the key that
+	// holds the device.
+	SeatID string `json:"sid,omitempty"`
 }
 
 // PrivateKeyFromHex parses a 32-byte ed25519 seed (64 hex chars) and
@@ -105,6 +110,9 @@ func Sign(t *VerifyToken, priv ed25519.PrivateKey) (string, error) {
 	return b64 + "." + base64.RawURLEncoding.EncodeToString(sig), nil
 }
 
+// ErrExpired is Verify's answer for a genuine token past its exp.
+var ErrExpired = errors.New("token expired")
+
 // Verify checks the signature with the server's public key and
 // returns the decoded payload. ExpiresAt is checked here so callers
 // don't accidentally trust stale tokens.
@@ -133,7 +141,7 @@ func Verify(raw string, pub ed25519.PublicKey) (*VerifyToken, error) {
 		return nil, fmt.Errorf("payload unmarshal: %w", err)
 	}
 	if t.ExpiresAt > 0 && time.Now().Unix() > t.ExpiresAt {
-		return nil, fmt.Errorf("token expired")
+		return nil, ErrExpired
 	}
 	return &t, nil
 }

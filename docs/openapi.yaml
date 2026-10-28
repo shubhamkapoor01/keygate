@@ -146,9 +146,10 @@ info:
     seconds: 60 for the per minute buckets, 3600 for the hourly
     code-sending bucket.
 
-    Failed `/license/activate`, `/license/verify`, `/license/refresh`
-    and `/license/deactivate` calls (an unknown key or token, and for
-    verify and refresh an unusable license) are counted per IP. After `BF_MAX_FAILS` failures
+    Failed `/license/activate`, `/license/verify` and
+    `/license/deactivate` calls (an unknown key, and for verify an
+    unusable license), and `/license/refresh` calls with a token that
+    does not verify, are counted per IP. After `BF_MAX_FAILS` failures
     (default 5) within 5 minutes the IP is locked out of all of
     `/license/*` for `BF_LOCKOUT_SECONDS` (default 30), doubling on each
     further lockout up to 30 minutes. The doubling is remembered until
@@ -174,8 +175,8 @@ info:
       `/license/download` and the portal license guards collapse every
       unusable or foreign license into `404 LICENSE_NOT_FOUND`.
 
-    Exceptions a client should know about: activate, verify and
-    deactivate answer `404 FEATURE_NOT_AVAILABLE` for a key of a SaaS
+    Exceptions a client should know about: activate, verify, refresh
+    and deactivate answer `404 FEATURE_NOT_AVAILABLE` for a SaaS
     product, and activate reports the specific `403` status of an
     unusable license (activation is how a returning customer learns
     their license has lapsed). Paid users otherwise discover lifecycle
@@ -519,10 +520,13 @@ paths:
         Verify for a client that holds its signed token rather than the
         key: answers as `/license/verify` does, with a new token. The
         token must verify, must not have expired, must be for this
-        identifier, and must have been issued since the device was last
-        activated, so releasing the device, rotating the key or removing
-        the member stops the tokens issued before. An expired token needs
-        the key again (`/license/verify`).
+        identifier, must come from the key that holds the device (the
+        license's own or the member's, see `sid`), and must have been
+        issued since the device was last activated, so releasing the
+        device, rotating the key or removing the member stops the tokens
+        issued before. An expired token needs the key again
+        (`/license/verify`). Only a token that does not verify counts
+        toward the lockout.
 
         `identifier` is trimmed first; blank or longer than 256 bytes is
         refused with 400.
@@ -6585,6 +6589,7 @@ components:
                 | `upd` | end of the maintenance period: install only releases published at or before this instant; absent = no separate limit |
                 | `grc` | grace days after `vun` (0 for a trial that Stripe does not bill and whose plan names no fallback plan; at least 1 for one whose plan does, until it moves) |
                 | `nce` | per-issuance nonce |
+                | `sid` | the member seat whose key the token was issued to; absent for the license's own key |
 
                 A client that ships updates through its own channel
                 must compare the release's publish date against `upd`

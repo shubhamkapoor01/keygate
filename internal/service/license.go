@@ -423,43 +423,46 @@ func (s *LicenseService) Refresh(ctx context.Context, in RefreshInput) (*VerifyR
 			return nil, lockedOut(retryAfter)
 		}
 	}
-	refuse := func() (*VerifyResult, error) {
+	tok, err := license.Verify(in.Token, s.SigningPublicKey())
+	if err != nil && !errors.Is(err, license.ErrExpired) {
+		// Only a token that doesn't verify can be a guess, so only it
+		// counts against the address. A genuine one, however stale,
+		// says nothing new: an office of laptops back from a holiday
+		// must not lock each other out.
 		if locked := s.recordFailure(in.IPAddress); locked != nil {
 			return nil, locked
 		}
 		return nil, licenseNotFound()
 	}
-
-	tok, err := license.Verify(in.Token, s.SigningPublicKey())
 	if err != nil || tok.Identifier != in.Identifier {
-		return refuse()
+		return nil, licenseNotFound()
 	}
 	act, err := s.store.FindActivation(ctx, tok.LicenseID, tok.Identifier)
 	if errors.Is(err, sql.ErrNoRows) {
-		return refuse()
+		return nil, licenseNotFound()
 	}
 	if err != nil {
 		return nil, apperr.Internal(err)
 	}
-	if time.Unix(tok.IssuedAt, 0).Add(refreshClockSlack).Before(act.CreatedAt) {
-		return refuse()
+	// The token must come from the key that holds the device: the
+	// licence's own key also opens a member's device, but rotating it
+	// leaves that device in place, so its token there must not live on.
+	if tok.SeatID != act.SeatID || time.Unix(tok.IssuedAt, 0).Add(refreshClockSlack).Before(act.CreatedAt) {
+		return nil, licenseNotFound()
 	}
 	lic, err := s.store.FindLicenseForActivation(ctx, act)
 	if errors.Is(err, sql.ErrNoRows) {
-		return refuse()
+		return nil, licenseNotFound()
 	}
 	if err != nil {
 		return nil, apperr.Internal(err)
-	}
-	if lic.ProductID != tok.ProductID {
-		return refuse()
 	}
 	if err := requireProductCapability(lic.Product, model.CapActivations, "device verification"); err != nil {
 		return nil, err
 	}
 	if firstErr(s.assertUsable(lic), seatPaused(lic)) != nil {
 		middleware.LicenseVerifications.WithLabelValues(lic.ProductID, "unusable").Inc()
-		return refuse()
+		return nil, licenseNotFound()
 	}
 	if err := refuseFloating(lic); err != nil {
 		return nil, err
@@ -784,6 +787,9 @@ func (s *LicenseService) signToken(ctx context.Context, lic *model.License, iden
 		UpdatesUntil: updatesUntil,
 		GraceDays:    grace,
 		Fingerprint:  license.Fingerprint(identifier, lic.ProductID),
+	}
+	if lic.KeySeat != nil {
+		t.SeatID = lic.KeySeat.ID
 	}
 	token, err := license.Sign(t, s.signingKey)
 	return token, features, err

@@ -103,6 +103,27 @@ func (f *refreshFixture) mint(lic *model.License, device string, issued time.Tim
 	return tok
 }
 
+// member is alice, a member who accepted her invite, and her key.
+func (f *refreshFixture) member(lic *model.License) (*model.Seat, string) {
+	f.t.Helper()
+	plain, hash := store.GenerateSeatInviteToken()
+	expires := time.Now().Add(time.Hour)
+	seat := &model.Seat{LicenseID: lic.ID, Email: "alice-" + lic.ID + "@example.com", Role: "member",
+		InviteTokenHash: hash, InviteExpiresAt: &expires}
+	if _, _, err := f.s.AddSeatWithinLimit(f.ctx, seat, 0); err != nil {
+		f.t.Fatal(err)
+	}
+	if _, _, err := f.s.AcceptSeatInvite(f.ctx, plain); err != nil {
+		f.t.Fatal(err)
+	}
+	seat, _ = f.s.FindSeatByID(f.ctx, seat.ID)
+	key, err := f.s.MemberKey(f.ctx, seat)
+	if err != nil || key == "" {
+		f.t.Fatalf("member key %q: %v", key, err)
+	}
+	return seat, key
+}
+
 func (f *refreshFixture) exec(query string, args ...any) {
 	f.t.Helper()
 	if _, err := f.s.DB.NewRaw(query, args...).Exec(f.ctx); err != nil {
@@ -151,50 +172,52 @@ func TestRefresh_IssuesAFreshToken(t *testing.T) {
 
 // Everything that stops a key from verifying a device stops its tokens
 // from refreshing, and a token never outlives the activation it was
-// issued for. Each refusal answers as an unknown key does and counts
-// against the address.
+// issued for. Each refusal answers as an unknown key does; only a token
+// that does not verify, which could be a guess, counts against the
+// address.
 func TestRefresh_Refusals(t *testing.T) {
 	f := newRefreshFixture(t)
 	_, otherPriv, _ := ed25519.GenerateKey(rand.Reader)
 
 	cases := []struct {
 		name  string
+		guess bool // the token does not verify
 		token func() (token, device string)
 	}{
-		{"expired token", func() (string, string) {
+		{"expired token", false, func() (string, string) {
 			lic, _, _ := f.license()
 			return f.mint(lic, "pc", time.Now().Add(-8*24*time.Hour), f.priv), "pc"
 		}},
-		{"tampered token", func() (string, string) {
+		{"tampered token", true, func() (string, string) {
 			_, _, tok := f.license()
 			b := []byte(tok)
 			b[3] ^= 1
 			return string(b), "pc"
 		}},
-		{"signed by another key", func() (string, string) {
+		{"signed by another key", true, func() (string, string) {
 			lic, _, _ := f.license()
 			return f.mint(lic, "pc", time.Now(), otherPriv), "pc"
 		}},
-		{"another device", func() (string, string) {
+		{"another device", false, func() (string, string) {
 			_, key, tok := f.license()
 			f.activate(key, "laptop")
 			return tok, "laptop"
 		}},
-		{"device deactivated", func() (string, string) {
+		{"device deactivated", false, func() (string, string) {
 			_, key, tok := f.license()
 			if err := f.ls.Deactivate(f.ctx, DeactivateInput{LicenseKey: key, Identifier: "pc"}); err != nil {
 				f.t.Fatal(err)
 			}
 			return tok, "pc"
 		}},
-		{"key rotated", func() (string, string) {
+		{"key rotated", false, func() (string, string) {
 			lic, _, tok := f.license()
 			if _, _, err := f.s.RotateLicenseKey(f.ctx, lic.ID); err != nil {
 				f.t.Fatal(err)
 			}
 			return tok, "pc"
 		}},
-		{"key rotated and the device activated on the new key", func() (string, string) {
+		{"key rotated and the device activated on the new key", false, func() (string, string) {
 			lic, _, _ := f.license()
 			old := f.mint(lic, "pc", time.Now().Add(-10*time.Second), f.priv)
 			newKey, _, err := f.s.RotateLicenseKey(f.ctx, lic.ID)
@@ -204,7 +227,7 @@ func TestRefresh_Refusals(t *testing.T) {
 			f.activate(newKey, "pc")
 			return old, "pc"
 		}},
-		{"device released and activated again", func() (string, string) {
+		{"device released and activated again", false, func() (string, string) {
 			lic, key, _ := f.license()
 			old := f.mint(lic, "pc", time.Now().Add(-10*time.Second), f.priv)
 			if err := f.ls.Deactivate(f.ctx, DeactivateInput{LicenseKey: key, Identifier: "pc"}); err != nil {
@@ -213,17 +236,17 @@ func TestRefresh_Refusals(t *testing.T) {
 			f.activate(key, "pc")
 			return old, "pc"
 		}},
-		{"licence revoked", func() (string, string) {
+		{"licence revoked", false, func() (string, string) {
 			lic, _, tok := f.license()
 			f.exec("UPDATE licenses SET status = 'revoked' WHERE id = ?", lic.ID)
 			return tok, "pc"
 		}},
-		{"licence expired", func() (string, string) {
+		{"licence expired", false, func() (string, string) {
 			lic, _, tok := f.license()
 			f.exec("UPDATE licenses SET status = 'expired' WHERE id = ?", lic.ID)
 			return tok, "pc"
 		}},
-		{"licence past its end and grace", func() (string, string) {
+		{"licence past its end and grace", false, func() (string, string) {
 			lic, _, tok := f.license()
 			f.exec("UPDATE licenses SET valid_until = now() - interval '30 days' WHERE id = ?", lic.ID)
 			return tok, "pc"
@@ -236,8 +259,12 @@ func TestRefresh_Refusals(t *testing.T) {
 			if _, err := f.ls.Refresh(f.ctx, RefreshInput{Token: tok, Identifier: device}); !isCode(err, "LICENSE_NOT_FOUND") {
 				t.Fatalf("refresh = %v, want LICENSE_NOT_FOUND", err)
 			}
-			if f.failures.failures != before+1 {
-				t.Fatalf("%d failures recorded, want 1", f.failures.failures-before)
+			want := 0
+			if c.guess {
+				want = 1
+			}
+			if got := f.failures.failures - before; got != want {
+				t.Fatalf("%d failures recorded, want %d", got, want)
 			}
 		})
 	}
@@ -268,7 +295,8 @@ func TestRefresh_FloatingPlan(t *testing.T) {
 }
 
 // Forged tokens lock an address out as unknown keys do, and the lockout
-// covers verify too. Other addresses are not affected.
+// covers verify too. Genuine tokens refused for being stale do not, and
+// other addresses are not affected.
 func TestRefresh_ForgedTokensLockTheAddressOut(t *testing.T) {
 	f := newRefreshFixture(t)
 	lic, key, tok := f.license()
@@ -280,6 +308,12 @@ func TestRefresh_ForgedTokensLockTheAddressOut(t *testing.T) {
 		return err
 	}
 
+	expired := f.mint(lic, "pc", time.Now().Add(-8*24*time.Hour), f.priv)
+	for i := 1; i <= 5; i++ {
+		if err := refresh(expired, "203.0.113.7"); !isCode(err, "LICENSE_NOT_FOUND") {
+			t.Fatalf("expired refresh %d = %v, want LICENSE_NOT_FOUND", i, err)
+		}
+	}
 	for i := 1; i <= 2; i++ {
 		if err := refresh(forged, "203.0.113.7"); !isCode(err, "LICENSE_NOT_FOUND") {
 			t.Fatalf("forged refresh %d = %v, want LICENSE_NOT_FOUND", i, err)
@@ -299,27 +333,53 @@ func TestRefresh_ForgedTokensLockTheAddressOut(t *testing.T) {
 	}
 }
 
+// The licence's key opens a member's device too, but the token it gets
+// there does not refresh: rotating that key leaves the device in place,
+// so a leaked key's token would otherwise outlive it. The member's own
+// tokens refresh, and none of this counts against the address.
+func TestRefresh_OnlyTheKeyHoldingTheDevice(t *testing.T) {
+	f := newRefreshFixture(t)
+	lic, ownerKey, _ := f.license()
+	_, aliceKey := f.member(lic)
+	aliceTok := f.activate(aliceKey, "alice-pc")
+	ownerTok := f.activate(ownerKey, "alice-pc")
+	if _, _, err := f.s.RotateLicenseKey(f.ctx, lic.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	before := f.failures.failures
+	if _, err := f.ls.Refresh(f.ctx, RefreshInput{Token: ownerTok, Identifier: "alice-pc"}); !isCode(err, "LICENSE_NOT_FOUND") {
+		t.Fatalf("refresh with the old licence key's token = %v, want LICENSE_NOT_FOUND", err)
+	}
+	if f.failures.failures != before {
+		t.Fatal("a genuine token counted against the address")
+	}
+	res, err := f.ls.Refresh(f.ctx, RefreshInput{Token: aliceTok, Identifier: "alice-pc"})
+	if err != nil {
+		t.Fatalf("refresh alice's own token: %v", err)
+	}
+	if _, err := f.ls.Refresh(f.ctx, RefreshInput{Token: res.Token, Identifier: "alice-pc"}); err != nil {
+		t.Fatalf("refresh alice's refreshed token: %v", err)
+	}
+}
+
+// A SaaS product answers refresh as it answers verify.
+func TestRefresh_SaaSProduct(t *testing.T) {
+	f := newRefreshFixture(t)
+	_, _, tok := f.license()
+	f.exec("UPDATE products SET type = 'saas' WHERE id = ?", f.prod.ID)
+	if _, err := f.ls.Refresh(f.ctx, RefreshInput{Token: tok, Identifier: "pc"}); !isCode(err, "FEATURE_NOT_AVAILABLE") {
+		t.Fatalf("refresh on a SaaS product = %v, want FEATURE_NOT_AVAILABLE", err)
+	}
+}
+
 // A member's device refreshes as the member's key verifies it: paused,
 // it stops, room again, it works, and removed, it stops for good. The
 // owner's devices are not affected.
 func TestRefresh_MemberDevice(t *testing.T) {
 	f := newRefreshFixture(t)
 	lic, ownerKey, ownerTok := f.license()
-	plain, hash := store.GenerateSeatInviteToken()
-	expires := time.Now().Add(time.Hour)
-	seat := &model.Seat{LicenseID: lic.ID, Email: "alice-" + f.suffix + "@example.com", Role: "member",
-		InviteTokenHash: hash, InviteExpiresAt: &expires}
-	if _, _, err := f.s.AddSeatWithinLimit(f.ctx, seat, 0); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := f.s.AcceptSeatInvite(f.ctx, plain); err != nil {
-		t.Fatal(err)
-	}
-	seat, _ = f.s.FindSeatByID(f.ctx, seat.ID)
-	aliceKey, err := f.s.MemberKey(f.ctx, seat)
-	if err != nil || aliceKey == "" {
-		t.Fatalf("member key %q: %v", aliceKey, err)
-	}
+	seat, aliceKey := f.member(lic)
 	aliceTok := f.activate(aliceKey, "alice-pc")
 	refresh := func(tok, device string) error {
 		_, err := f.ls.Refresh(f.ctx, RefreshInput{Token: tok, Identifier: device})
@@ -340,6 +400,14 @@ func TestRefresh_MemberDevice(t *testing.T) {
 	if err := refresh(aliceTok, "alice-pc"); err != nil {
 		t.Fatalf("refresh once there is room again: %v", err)
 	}
+
+	// A member removed by an older version kept their devices; their
+	// tokens stop all the same.
+	f.exec("UPDATE seats SET removed_at = now() WHERE id = ?", seat.ID)
+	if err := refresh(aliceTok, "alice-pc"); !isCode(err, "LICENSE_NOT_FOUND") {
+		t.Fatalf("refresh with alice removed but her device left = %v, want LICENSE_NOT_FOUND", err)
+	}
+	f.exec("UPDATE seats SET removed_at = NULL WHERE id = ?", seat.ID)
 
 	seats := NewSeatService(f.s, NewWebhookService(f.s, slog.Default(), time.Second, 1, true), nil, slog.Default(), "")
 	if err := seats.RemoveSeat(f.ctx, ownerKey, seat.ID, "", "", lic.Email); err != nil {
