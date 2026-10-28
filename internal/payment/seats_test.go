@@ -506,6 +506,14 @@ func TestSeats_ChangeRefundKeepsLicense(t *testing.T) {
 	if l := f.license(); l.Status != model.StatusRevoked {
 		t.Fatalf("after refunding the subscription's invoice: status %s, want revoked", l.Status)
 	}
+	// Refunding it does not stop Stripe billing; the subscription is
+	// cancelled so it does not charge a revoked licence again.
+	f.fake.mu.Lock()
+	canceled := f.fake.canceled
+	f.fake.mu.Unlock()
+	if canceled != 1 {
+		t.Fatalf("subscription cancelled %d times, want once", canceled)
+	}
 }
 
 // The checkout of a plan sold per seat starts at the quantity asked for
@@ -880,6 +888,16 @@ func refundInvoices(subID string) func(w http.ResponseWriter, r *http.Request) b
 			_, _ = w.Write([]byte(invoice("in_newperiod", "subscription_update", line(true), line(false))))
 		case "/v1/invoices/in_cycle":
 			_, _ = w.Write([]byte(invoice("in_cycle", "subscription_cycle", line(false))))
+		case "/v1/invoices/in_running":
+			// The period the licence is in, a change billed since.
+			running := fmt.Sprintf(`{"id":"il_run","object":"line_item","amount":1000,"period":{"start":%d,"end":%d},"parent":{"type":"subscription_item_details","subscription_item_details":{"proration":false}}}`,
+				time.Now().Add(-5*24*time.Hour).Unix(), time.Now().Add(25*24*time.Hour).Unix())
+			_, _ = w.Write([]byte(invoice("in_running", "subscription_create", running)))
+		case "/v1/invoices/in_old":
+			// A period that ended yesterday.
+			old := fmt.Sprintf(`{"id":"il_old","object":"line_item","amount":1000,"period":{"start":%d,"end":%d},"parent":{"type":"subscription_item_details","subscription_item_details":{"proration":false}}}`,
+				time.Now().Add(-31*24*time.Hour).Unix(), time.Now().Add(-24*time.Hour).Unix())
+			_, _ = w.Write([]byte(invoice("in_old", "subscription_cycle", old)))
 		default:
 			return false
 		}
@@ -897,6 +915,78 @@ func TestSeats_NewPeriodRefundRevokes(t *testing.T) {
 	}
 	if l := f.license(); l.Status != model.StatusRevoked {
 		t.Fatalf("after refunding a new period: status %s, want revoked", l.Status)
+	}
+}
+
+// Refunding the period the licence is in revokes it, though a seat
+// change billed since made a newer invoice the subscription's latest.
+func TestSeats_RunningPeriodRefundAfterAChangeRevokes(t *testing.T) {
+	f := newSeatFixture(t, 2)
+	f.fake.extra = refundInvoices(f.lic.StripeSubscriptionID)
+	p := f.preview(fmt.Sprintf(`{"license_id":%q,"quantity":3}`, f.lic.ID))
+	if c, _ := f.change(p, ""); c != http.StatusOK {
+		t.Fatalf("change = %d", c)
+	}
+	if err := f.h.onChargeRefunded(f.ctx, []byte(`{"id":"ch_run","invoice":"in_running","refunded":true,"amount_refunded":5000}`)); err != nil {
+		t.Fatal(err)
+	}
+	if l := f.license(); l.Status != model.StatusRevoked {
+		t.Fatalf("after refunding the running period: status %s, want revoked", l.Status)
+	}
+}
+
+// A refund is read at the time it was made: retried after the period
+// ended, it still ends the subscription the first delivery would have.
+func TestSeats_RefundReadAtItsOwnTime(t *testing.T) {
+	f := newSeatFixture(t, 2)
+	f.fake.extra = refundInvoices(f.lic.StripeSubscriptionID)
+	made := time.Now().Add(-2 * 24 * time.Hour).Unix() // before in_old's period ended
+	if err := f.h.onChargeRefundedAt(f.ctx, []byte(`{"id":"ch_late","invoice":"in_old","refunded":true,"amount_refunded":5000}`), made); err != nil {
+		t.Fatal(err)
+	}
+	if l := f.license(); l.Status != model.StatusRevoked {
+		t.Fatalf("refund made in its period, delivered after: status %s, want revoked", l.Status)
+	}
+}
+
+// A lost dispute over what a change cost still ends the subscription:
+// billing the same card again would invite another.
+func TestSeats_LostDisputeOverAChangeEndsTheSubscription(t *testing.T) {
+	f := newSeatFixture(t, 2)
+	f.fake.extra = refundInvoices(f.lic.StripeSubscriptionID)
+	if err := f.h.takeBackCharge(f.ctx, refundedCharge{ID: "ch_dchange", Invoice: "in_change", Refunded: true}, "dispute_lost", 0); err != nil {
+		t.Fatal(err)
+	}
+	if l := f.license(); l.Status != model.StatusRevoked {
+		t.Fatalf("after a lost dispute over a change: status %s, want revoked", l.Status)
+	}
+	f.fake.mu.Lock()
+	canceled := f.fake.canceled
+	f.fake.mu.Unlock()
+	if canceled != 1 {
+		t.Fatalf("subscription cancelled %d times, want 1", canceled)
+	}
+}
+
+// Refunding a period already over gives that money back: the licence
+// and the subscription carry on, and the refund is noted on the licence.
+func TestSeats_PastPeriodRefundKeepsLicense(t *testing.T) {
+	f := newSeatFixture(t, 2)
+	f.fake.extra = refundInvoices(f.lic.StripeSubscriptionID)
+	if err := f.h.onChargeRefunded(f.ctx, []byte(`{"id":"ch_past","invoice":"in_old","refunded":true,"amount_refunded":5000}`)); err != nil {
+		t.Fatal(err)
+	}
+	if l := f.license(); l.Status != model.StatusActive {
+		t.Fatalf("after refunding a past period: status %s, want active", l.Status)
+	}
+	f.fake.mu.Lock()
+	canceled := f.fake.canceled
+	f.fake.mu.Unlock()
+	if canceled != 0 {
+		t.Fatalf("subscription cancelled %d times for a past period's refund, want 0", canceled)
+	}
+	if n := auditCountAtLeast(f.s, f.ctx, f.lic.ID, "past_invoice_refunded", 1); n != 1 {
+		t.Fatalf("refund noted %d times, want once", n)
 	}
 }
 

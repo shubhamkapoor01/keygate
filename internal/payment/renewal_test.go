@@ -533,8 +533,9 @@ func TestRenewal_RefundBeforeFulfilment(t *testing.T) {
 		t.Fatalf("replay applied a refunded renewal: %v", got)
 	}
 	// A refund of an unknown payment intent without renewal metadata
-	// still takes the purchase path (customer fallback). Stripe is
-	// asked for invoice payments on the way; none exist.
+	// still takes the purchase path, and finds the licence through the
+	// customer alone: noted there, not revoked. Stripe is asked for
+	// invoice payments on the way; none exist.
 	stubStripe(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/invoice_payments" {
 			t.Errorf("unexpected Stripe call %s %s", r.Method, r.URL.Path)
@@ -546,8 +547,44 @@ func TestRenewal_RefundBeforeFulfilment(t *testing.T) {
 	if err := h.onChargeRefunded(ctx, fmt.Appendf(nil, `{"id":"ch_buy","customer":"cus_early_%s","payment_intent":"pi_buy_%s","refunded":true}`, plan.Slug, plan.Slug)); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := s.FindLicenseByID(ctx, lic.ID); got.Status != model.StatusRevoked {
-		t.Fatalf("purchase refund did not revoke: %s", got.Status)
+	if got, _ := s.FindLicenseByID(ctx, lic.ID); got.Status == model.StatusRevoked {
+		t.Fatal("a refund found through the customer alone revoked the licence")
+	}
+	if n := auditCountAtLeast(s, ctx, lic.ID, "refund_unmatched", 1); n != 1 {
+		t.Fatalf("refund noted %d times, want once", n)
+	}
+}
+
+// A dispute lost before the renewal it paid for was applied: the
+// charge's metadata, read from Stripe, says it was a renewal, and the
+// renewal, once applied, is recorded as refunded.
+func TestRenewal_LostDisputeBeforeFulfilment(t *testing.T) {
+	s, ctx := openStore(t)
+	defer s.Close()
+	plan := seedMaintenancePlan(t, s, ctx, "dpearly")
+	current := time.Now().Add(30 * 24 * time.Hour).Truncate(time.Second)
+	lic := seedPerpetualLicense(t, s, ctx, plan, &current)
+	h := &StripeHandler{Store: s}
+	pi := "pi_dpearly_" + plan.Slug
+	stubStripe(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/charges/ch_dpearly" {
+			fmt.Fprintf(w, `{"id":"ch_dpearly","object":"charge","payment_intent":%q,"metadata":{"kind":"renewal","license_id":%q}}`, pi, lic.ID)
+			return
+		}
+		t.Errorf("unexpected Stripe call %s %s", r.Method, r.URL.Path)
+		http.Error(w, `{"error":{"message":"unexpected"}}`, http.StatusNotFound)
+	})
+	if err := h.onDisputeClosed(ctx, []byte(`{"id":"dp_early","object":"dispute","charge":"ch_dpearly","amount":900,"status":"lost"}`)); err != nil {
+		t.Fatalf("lost dispute: %v", err)
+	}
+	if got, _ := s.FindLicenseByID(ctx, lic.ID); got.Status != model.StatusActive {
+		t.Fatalf("a lost dispute over a renewal revoked the licence: %s", got.Status)
+	}
+	if ok, err := h.fulfillCheckout(ctx, lic.Email, "", "", pi, renewalMeta("cs_dpearly_"+plan.Slug, lic.ID, 365), "webhook"); err != nil || !ok {
+		t.Fatalf("late completion: %v %v", ok, err)
+	}
+	if got := updatesUntil(t, s, ctx, lic.ID); !sameInstant(*got, current) {
+		t.Fatalf("a renewal whose dispute was lost was applied: %v", got)
 	}
 }
 
@@ -1250,4 +1287,35 @@ func TestFulfillCheckout_UnmanagedSessionChecksTheSoldKind(t *testing.T) {
 	// that is now perpetual — takes the same branch; it cannot be
 	// driven from here because resolving that session's plan goes to
 	// Stripe.
+}
+
+// A customer renews, is refunded, renews again and is refunded again:
+// each refund takes back exactly its own renewal, so the period ends
+// where it did before either purchase. The second refund once read the
+// first one's revert as an admin edit and took a further year off.
+func TestRenewalRefundedTwiceInTurn(t *testing.T) {
+	s, ctx := openStore(t)
+	defer s.Close()
+	plan := seedMaintenancePlan(t, s, ctx, "twice")
+	current := time.Now().Add(30 * 24 * time.Hour).Truncate(time.Second)
+	lic := seedPerpetualLicense(t, s, ctx, plan, &current)
+	h := &StripeHandler{Store: s}
+
+	for i := range 3 {
+		pi := fmt.Sprintf("pi_twice_%s_%d", plan.Slug, i)
+		sess := fmt.Sprintf("cs_twice_%s_%d", plan.Slug, i)
+		if ok, err := h.fulfillCheckout(ctx, lic.Email, "", "", pi, renewalMeta(sess, lic.ID, 365), "webhook"); err != nil || !ok {
+			t.Fatalf("renewal %d: ok=%v err=%v", i, ok, err)
+		}
+		if got := updatesUntil(t, s, ctx, lic.ID); got == nil || !sameInstant(*got, current.AddDate(0, 0, 365)) {
+			t.Fatalf("renewal %d applied: %v, want a year on %v", i, got, current)
+		}
+		refund := fmt.Appendf(nil, `{"id":"ch_twice_%d","payment_intent":"%s","refunded":true,"metadata":{"kind":"renewal","license_id":"%s"}}`, i, pi, lic.ID)
+		if err := h.onChargeRefunded(ctx, refund); err != nil {
+			t.Fatalf("refund %d: %v", i, err)
+		}
+		if got := updatesUntil(t, s, ctx, lic.ID); got == nil || !sameInstant(*got, current) {
+			t.Fatalf("refund %d: the period ends %v, want %v as before any renewal", i, got, current)
+		}
+	}
 }

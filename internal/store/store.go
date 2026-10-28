@@ -1202,6 +1202,8 @@ func updateLicenseAndSubscriptionIn(ctx context.Context, tx bun.Tx, lic *model.L
 	}
 	lic.WasStripePaused = prior.Status == model.StatusSuspended && prior.By == model.SuspendedByStripe
 	lic.WasCanceled = prior.Status == model.StatusCanceled
+	lic.WasExpired = prior.Status == model.StatusExpired
+	lic.WasRevoked = prior.Status == model.StatusRevoked
 	lic.WasPastDue, lic.PriorPastDueAt = prior.Status == model.StatusPastDue, prior.PastDueAt
 	// A licence already past due keeps the moment its episode began: two
 	// events entering it at once would each stamp their own, and the
@@ -1245,12 +1247,23 @@ func updateLicenseAndSubscriptionIn(ctx context.Context, tx bun.Tx, lic *model.L
 		case model.StatusActive, model.StatusTrialing, model.StatusPastDue:
 			q = q.Where("NOT (status = ? AND COALESCE(suspended_by, ?) <> ?)",
 				model.StatusSuspended, model.SuspendedByAdmin, model.SuspendedByStripe)
+			// Nor an operator's suspension that non-payment then ended:
+			// canceled, the suspension still on record.
+			q = q.Where("NOT (status = ? AND COALESCE(suspended_by, '') = ?)",
+				model.StatusCanceled, model.SuspendedByAdmin)
 			// Stripe never brings a canceled subscription back, so only a
 			// current read saying it is live (a canceled licence that was
 			// "unpaid", now paid) may revive one — an event payload is
 			// history and may predate the end.
 			if asOf == nil {
 				q = q.Where("status <> ?", model.StatusCanceled)
+			}
+			// Still unpaid is no reason to bring back a licence that
+			// expired for want of payment (past due first, as the sweep
+			// leaves it): only payment does. One that expired at the end
+			// of its grace may still go into dunning.
+			if lic.Status == model.StatusPastDue {
+				q = q.Where("NOT (status = ? AND past_due_at IS NOT NULL)", model.StatusExpired)
 			}
 		case model.StatusSuspended:
 			// A pause must not replace an operator's suspension: it would
@@ -3518,6 +3531,12 @@ func RevertLicenseRenewalIn(ctx context.Context, tx bun.IDB, r *model.LicenseRen
 	if r.RefundedAt != nil {
 		return nil
 	}
+	// On the ledger's clock, as created_at is: the replay compares a
+	// refund with the purchases after it.
+	now, err := ledgerStamp(ctx, tx)
+	if err != nil {
+		return err
+	}
 	// Only the current period's ledger: renewals from before a reset
 	// are recorded as refunded but move nothing.
 	var ledger []*model.LicenseRenewal
@@ -3525,7 +3544,6 @@ func RevertLicenseRenewalIn(ctx context.Context, tx bun.IDB, r *model.LicenseRen
 		OrderExpr("created_at ASC, id ASC").Scan(ctx); err != nil {
 		return err
 	}
-	now := time.Now()
 	if lic.UpdatesUntil != nil && r.UpdatesUntil != nil && r.SupersededAt == nil {
 		predicted := model.ReplayRenewals(ledger)
 		for _, row := range ledger {
