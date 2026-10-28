@@ -196,7 +196,7 @@ func TestRefresh_Refusals(t *testing.T) {
 		}},
 		{"key rotated and the device activated on the new key", func() (string, string) {
 			lic, _, _ := f.license()
-			old := f.mint(lic, "pc", time.Now().Add(-2*time.Minute), f.priv)
+			old := f.mint(lic, "pc", time.Now().Add(-10*time.Second), f.priv)
 			newKey, _, err := f.s.RotateLicenseKey(f.ctx, lic.ID)
 			if err != nil {
 				f.t.Fatal(err)
@@ -206,7 +206,7 @@ func TestRefresh_Refusals(t *testing.T) {
 		}},
 		{"device released and activated again", func() (string, string) {
 			lic, key, _ := f.license()
-			old := f.mint(lic, "pc", time.Now().Add(-2*time.Minute), f.priv)
+			old := f.mint(lic, "pc", time.Now().Add(-10*time.Second), f.priv)
 			if err := f.ls.Deactivate(f.ctx, DeactivateInput{LicenseKey: key, Identifier: "pc"}); err != nil {
 				f.t.Fatal(err)
 			}

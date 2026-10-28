@@ -401,8 +401,9 @@ func refuseFloating(lic *model.License) error {
 
 // refreshClockSlack is how much earlier than its device's activation a
 // token may say it was issued: the activation's time comes from the
-// database's clock, the token's from this server's.
-const refreshClockSlack = time.Minute
+// database's clock, the token's from this server's, in whole seconds.
+// Kept short: a token issued just before a release must not outlive it.
+const refreshClockSlack = 5 * time.Second
 
 type RefreshInput struct {
 	Token      string

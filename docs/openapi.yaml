@@ -146,9 +146,9 @@ info:
     seconds: 60 for the per minute buckets, 3600 for the hourly
     code-sending bucket.
 
-    Failed `/license/activate`, `/license/verify` and
-    `/license/deactivate` calls (an unknown key, and for verify an
-    unusable license) are counted per IP. After `BF_MAX_FAILS` failures
+    Failed `/license/activate`, `/license/verify`, `/license/refresh`
+    and `/license/deactivate` calls (an unknown key or token, and for
+    verify and refresh an unusable license) are counted per IP. After `BF_MAX_FAILS` failures
     (default 5) within 5 minutes the IP is locked out of all of
     `/license/*` for `BF_LOCKOUT_SECONDS` (default 30), doubling on each
     further lockout up to 30 minutes. The doubling is remembered until
@@ -164,6 +164,8 @@ info:
       key that does not exist, a license that is suspended, revoked,
       expired or canceled past its paid period, and an identifier that
       is not activated.
+    - `/license/refresh` answers that same 404 for every token it
+      refuses.
     - `/license/deactivate` answers `404 LICENSE_NOT_FOUND` for an
       unknown key or an identifier that is not activated. It does not
       check the license's status: a suspended, revoked or expired
