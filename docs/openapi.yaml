@@ -3101,8 +3101,8 @@ paths:
           description: |
             `UPGRADE_IN_PROGRESS`, a checkout opened earlier for this license
             has been paid and is still being applied. `SEATS_IN_USE`, more
-            people are on the license than the plan sells seats
-            (`details.in_use`, `details.seat_limit`)
+            people are on the license than the plan sells seats, or than its
+            `max_seats` if not sold per seat (`details.in_use`, `details.seat_limit`)
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "503":
           description: "`UPGRADE_UNAVAILABLE`, the plan's Stripe price can't be sold right now"

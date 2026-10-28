@@ -58,7 +58,7 @@ const upgradeIneligibleProvider = "stripe_upgrade_ineligible"
 var errUpgradeIneligible = errors.New("upgrade no longer applies")
 
 // errTeamTooLarge means more people are on the licence than the plan
-// sold per seat sells seats for.
+// holds.
 var errTeamTooLarge = errors.New("more people than the plan sells seats for")
 
 // errUpgradeClosed means the upgrade will never apply and nothing is
@@ -206,6 +206,8 @@ func (h *StripeHandler) StartUpgrade(c *gin.Context) {
 
 	var url string
 	people := 0
+	// The most people the plan holds; 0 is no limit.
+	seatLimit, _ := plan.Limits(plan.MaxQuantity)
 	err = h.Store.WithXactLock(c, store.UpgradeLockKey(lic.ID), func(ctx context.Context, tx bun.Tx) error {
 		// Stripe is asked under the lock, which invites wait on: bounded.
 		sctx, cancel := stripeContext(c)
@@ -235,15 +237,17 @@ func (h *StripeHandler) StartUpgrade(c *gin.Context) {
 		// waits on (see store.UpgradeLockKey): nobody joins between the
 		// count and the checkout.
 		seats := 0
-		if plan.PerSeat {
+		if seatLimit > 0 {
 			members, err := store.CountActiveSeatsIn(ctx, tx, lic.ID)
 			if err != nil {
 				return err
 			}
-			if people = members + 1; people > plan.MaxQuantity {
+			if people = members + 1; people > seatLimit {
 				return errTeamTooLarge
 			}
-			seats = max(people, plan.MinQuantity)
+			if plan.PerSeat {
+				seats = max(people, plan.MinQuantity)
+			}
 		}
 		for _, p := range pending {
 			if err := expireCheckout(sctx, p.StripeCheckoutSessionID); err != nil {
@@ -325,8 +329,8 @@ func (h *StripeHandler) StartUpgrade(c *gin.Context) {
 	}
 	if errors.Is(err, errTeamTooLarge) {
 		response.Conflict(c, "SEATS_IN_USE",
-			fmt.Sprintf("%d people are on this license; %s is sold for up to %d", people, plan.Name, plan.MaxQuantity),
-			gin.H{"in_use": people, "seat_limit": plan.MaxQuantity})
+			fmt.Sprintf("%d people are on this license; %s is sold for up to %d", people, plan.Name, seatLimit),
+			gin.H{"in_use": people, "seat_limit": seatLimit})
 		return
 	}
 	if errors.Is(err, errUpgradeInProgress) {

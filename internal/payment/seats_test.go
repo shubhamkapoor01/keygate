@@ -1114,6 +1114,58 @@ func TestUpgrade_PerSeatTeamTooLarge(t *testing.T) {
 	}
 }
 
+// The same holds for a plan not sold per seat: its max_seats.
+func TestUpgrade_TeamLargerThanMaxSeats(t *testing.T) {
+	f := newUpgradeFixture(t, "upmax")
+	if _, err := f.s.DB.NewRaw("UPDATE plans SET max_seats = 2 WHERE id = ?", f.paid.ID).Exec(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	sub := newFakeSubscription("sub_unused_"+f.tag, f.paid.StripePriceID, 1, nil)
+	sub.extra = func(w http.ResponseWriter, r *http.Request) bool {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/v1/prices/"):
+			fmt.Fprintf(w, `{"id":%q,"object":"price","type":"recurring","active":true}`, f.paid.StripePriceID)
+		case r.URL.Path == "/v1/checkout/sessions":
+			fmt.Fprintf(w, `{"id":"cs_upmax_%s","object":"checkout.session","url":"https://checkout.stripe.test/x"}`, f.tag)
+		default:
+			return false
+		}
+		return true
+	}
+	stubStripe(t, sub.serve(t))
+	start := func() (int, map[string]any) {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, "/portal/licenses/upgrade",
+			bytes.NewBufferString(fmt.Sprintf(`{"license_id":%q,"plan_id":%q}`, f.lic.ID, f.paid.ID)))
+		c.Request.Header.Set("Content-Type", "application/json")
+		c.Set("email", f.lic.Email)
+		f.h.StartUpgrade(c)
+		var out map[string]any
+		_ = json.Unmarshal(w.Body.Bytes(), &out)
+		return w.Code, out
+	}
+	var seats []*model.Seat
+	for i := range 2 {
+		seat := &model.Seat{LicenseID: f.lic.ID, Email: fmt.Sprintf("m%d-%s", i, f.lic.Email), Role: "member"}
+		if err := f.s.CreateSeat(f.ctx, seat); err != nil {
+			t.Fatal(err)
+		}
+		seats = append(seats, seat)
+	}
+	code, out := start()
+	e, _ := out["error"].(map[string]any)
+	if code != http.StatusConflict || envCode(out) != "SEATS_IN_USE" || fmt.Sprint(e["details"]) != "map[in_use:3 seat_limit:2]" {
+		t.Fatalf("upgrade of 3 people to a plan of 2 seats = %d %v, want 409 SEATS_IN_USE, 3 of 2", code, out)
+	}
+	if _, _, err := f.s.RemoveSeat(f.ctx, seats[1].ID); err != nil {
+		t.Fatal(err)
+	}
+	if code, out := start(); code != http.StatusOK {
+		t.Fatalf("upgrade of 2 people to a plan of 2 seats = %d %v, want a checkout", code, out)
+	}
+}
+
 // change-plan sent again after its answer was lost finds the change made.
 func TestChangePlan_RetryFindsItMade(t *testing.T) {
 	f := newSeatFixture(t, 3)
