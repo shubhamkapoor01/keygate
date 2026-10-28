@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/tabloy/keygate/internal/license"
+	"github.com/tabloy/keygate/internal/middleware"
 	"github.com/tabloy/keygate/internal/model"
 	"github.com/tabloy/keygate/internal/store"
 	"github.com/tabloy/keygate/pkg/apperr"
@@ -263,6 +264,38 @@ func TestRefresh_FloatingPlan(t *testing.T) {
 	f.exec("UPDATE plans SET license_model = 'floating', floating_timeout = 30 WHERE id = ?", f.plan.ID)
 	if _, err := f.ls.Refresh(f.ctx, RefreshInput{Token: tok, Identifier: "pc"}); !isCode(err, "FLOATING_LICENSE") {
 		t.Fatalf("refresh on a floating plan = %v, want FLOATING_LICENSE", err)
+	}
+}
+
+// Forged tokens lock an address out as unknown keys do, and the lockout
+// covers verify too. Other addresses are not affected.
+func TestRefresh_ForgedTokensLockTheAddressOut(t *testing.T) {
+	f := newRefreshFixture(t)
+	lic, key, tok := f.license()
+	_, otherPriv, _ := ed25519.GenerateKey(rand.Reader)
+	forged := f.mint(lic, "pc", time.Now(), otherPriv)
+	ls := NewLicenseService(f.s, f.priv, slog.Default(), middleware.NewBruteForceProtection(3, time.Minute, time.Hour, time.Minute), nil)
+	refresh := func(tok, ip string) error {
+		_, err := ls.Refresh(f.ctx, RefreshInput{Token: tok, Identifier: "pc", IPAddress: ip})
+		return err
+	}
+
+	for i := 1; i <= 2; i++ {
+		if err := refresh(forged, "203.0.113.7"); !isCode(err, "LICENSE_NOT_FOUND") {
+			t.Fatalf("forged refresh %d = %v, want LICENSE_NOT_FOUND", i, err)
+		}
+	}
+	if err := refresh(forged, "203.0.113.7"); !isCode(err, "LOCKED_OUT") {
+		t.Fatalf("third forged refresh = %v, want LOCKED_OUT", err)
+	}
+	if err := refresh(tok, "203.0.113.7"); !isCode(err, "LOCKED_OUT") {
+		t.Fatalf("genuine refresh from the locked address = %v, want LOCKED_OUT", err)
+	}
+	if _, err := ls.Verify(f.ctx, VerifyInput{LicenseKey: key, Identifier: "pc", IPAddress: "203.0.113.7"}); !isCode(err, "LOCKED_OUT") {
+		t.Fatalf("verify from the locked address = %v, want LOCKED_OUT", err)
+	}
+	if err := refresh(tok, "198.51.100.9"); err != nil {
+		t.Fatalf("refresh from another address: %v", err)
 	}
 }
 
